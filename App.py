@@ -295,6 +295,31 @@ def fetch_nasa(lat, lon):
     # Estimate ws80 from ws50 using wind shear power law (α=0.14 for open terrain)
     ws80  = round(ws50 * (80/50)**0.14, 2) if ws50 else None
 
+    # Monthly data — NASA POWER uses 3-letter keys JAN..DEC
+    MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+    DAYS   = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    def gm(param, mon):
+        return p.get(param, {}).get(mon)
+
+    monthly = {}
+    for i, m in enumerate(MONTHS):
+        ghi_m  = gm("ALLSKY_SFC_SW_DWN", m)
+        clr_m  = gm("CLRSKY_SFC_SW_DWN", m)
+        t_m    = gm("T2M", m)
+        tmax_m = gm("T2M_MAX", m)
+        ws_m   = gm("WS50M", m)
+        kt_m   = gm("ALLSKY_KT", m)
+        monthly[m] = {
+            "days":       DAYS[i],
+            "ghi_daily":  round(ghi_m, 3) if ghi_m else None,
+            "ghi_month":  round(ghi_m * DAYS[i], 1) if ghi_m else None,
+            "clear_sky":  round(clr_m, 2) if clr_m else None,
+            "clearness":  round(kt_m, 3) if kt_m else None,
+            "temp_avg":   round(t_m, 1) if t_m else None,
+            "temp_max":   round(tmax_m, 1) if tmax_m else None,
+            "wind_50m":   round(ws_m, 2) if ws_m else None,
+        }
+
     return {
         "ghi_daily":   round(ghi_d, 3) if ghi_d else None,
         "ghi_annual":  int(ghi_d * 365) if ghi_d else None,
@@ -308,6 +333,7 @@ def fetch_nasa(lat, lon):
         "temp_max":    round(g("T2M_MAX"), 1) if g("T2M_MAX") else None,
         "temp_min":    round(g("T2M_MIN"), 1) if g("T2M_MIN") else None,
         "humidity":    round(g("RH2M"), 1) if g("RH2M") else None,
+        "monthly":     monthly,
         "source":      "NASA POWER Climatology API (2001–2022)",
     }
 
@@ -536,6 +562,55 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
 # ─────────────────────────────────────────────────────────────────────────────
 # PDF GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
+
+MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTH_KEYS  = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+
+def calc_monthly(climate, act_kwp, pr, degr_pct):
+    """
+    Calculate monthly generation, peak sun hours, capacity factor, and temp derating.
+    Uses NASA POWER monthly GHI data and the system PR.
+    Returns list of 12 dicts.
+    """
+    rows = []
+    monthly = climate.get("monthly", {})
+    base_temp_coef = -0.0029  # TOPCon default
+
+    for i, mk in enumerate(MONTH_KEYS):
+        m = monthly.get(mk, {})
+        ghi_d = m.get("ghi_daily") or climate.get("psh", 5.5)
+        days  = m.get("days", 30)
+        temp  = m.get("temp_avg") or climate.get("temp", 28)
+        tmax  = m.get("temp_max") or temp + 12
+
+        # Monthly cell temp (use avg + NOCT offset)
+        cell_temp = temp + 25
+        t_dera    = 1 + base_temp_coef * (cell_temp - 25)
+        t_dera    = max(0.75, min(1.02, t_dera))
+
+        # Monthly PR (temperature varies month to month)
+        monthly_pr = pr / 100 * t_dera / (1 + base_temp_coef * (climate.get("temp", 28) + 25 - 25))
+        monthly_pr = min(1.0, monthly_pr)
+
+        gen_kwh = act_kwp * ghi_d * days * monthly_pr
+        cf      = gen_kwh / (act_kwp * days * 24) * 100 if act_kwp > 0 else 0
+
+        rows.append({
+            "month":     MONTH_NAMES[i],
+            "days":      days,
+            "ghi_daily": round(ghi_d, 2),
+            "ghi_total": round(ghi_d * days, 1),
+            "temp_avg":  temp,
+            "temp_max":  tmax,
+            "cell_temp": round(cell_temp, 1),
+            "t_dera_pct":round((1 - t_dera) * 100, 1),
+            "wind_50m":  m.get("wind_50m") or climate.get("ws50", 4.5),
+            "clearness": m.get("clearness") or climate.get("clearness", 0.62),
+            "gen_mwh":   round(gen_kwh / 1000, 1),
+            "cf_pct":    round(cf, 1),
+        })
+    return rows
+
 
 def safe_pdf_text(text):
     """
@@ -897,6 +972,99 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     story.append(Spacer(1, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3b: MONTHLY SOLAR RESOURCE & GENERATION TABLE
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 3b — MONTHLY SOLAR RESOURCE &amp; GENERATION FORECAST"))
+    story.append(Spacer(1, 5))
+    story.append(Paragraph(
+        f"Monthly averages from NASA POWER 22-year climatology (2001–2022). "
+        f"Generation calculated for {fmt(r['act_kwp'],1)} kWp system at PR {r['pr']}%.",
+        S_note))
+    story.append(Spacer(1, 5))
+
+    monthly_rows_pdf = calc_monthly(climate, r['act_kwp'], r['pr'], r['degr'])
+    annual_total_mwh = sum(row['gen_mwh'] for row in monthly_rows_pdf)
+
+    # Column headers
+    mo_header = ["Month", "Days", "GHI\n(kWh/m\u00b2/day)", "Monthly GHI\n(kWh/m\u00b2)",
+                 "Kt", "Avg Temp\n(\u00b0C)", "Max Temp\n(\u00b0C)", "Wind\n(m/s)",
+                 "Temp\nDerating", "Generation\n(MWh)", "Cap.\nFactor %"]
+    mo_data = [mo_header]
+    for row in monthly_rows_pdf:
+        mo_data.append([
+            row["month"],
+            str(row["days"]),
+            f"{row['ghi_daily']:.2f}",
+            f"{row['ghi_total']:.0f}",
+            f"{row['clearness']:.3f}" if row['clearness'] else "—",
+            f"{row['temp_avg']:.1f}",
+            f"{row['temp_max']:.1f}",
+            f"{row['wind_50m']:.1f}" if row['wind_50m'] else "—",
+            f"-{row['t_dera_pct']}%",
+            f"{row['gen_mwh']:.1f}",
+            f"{row['cf_pct']:.1f}%",
+        ])
+
+    # Annual totals row
+    avg_ghi  = round(sum(r2["ghi_daily"] for r2 in monthly_rows_pdf)/12, 2)
+    tot_ghi  = round(sum(r2["ghi_total"] for r2 in monthly_rows_pdf), 0)
+    avg_kt   = round(sum(r2["clearness"] for r2 in monthly_rows_pdf if r2["clearness"])/12, 3)
+    avg_temp = round(sum(r2["temp_avg"]  for r2 in monthly_rows_pdf)/12, 1)
+    max_temp = round(max(r2["temp_max"]  for r2 in monthly_rows_pdf), 1)
+    avg_wind = round(sum(r2["wind_50m"]  for r2 in monthly_rows_pdf if r2["wind_50m"])/12, 1)
+    avg_dera = round(sum(r2["t_dera_pct"]for r2 in monthly_rows_pdf)/12, 1)
+    avg_cf   = round(sum(r2["cf_pct"]    for r2 in monthly_rows_pdf)/12, 1)
+    mo_data.append([
+        "ANNUAL", "365",
+        f"{avg_ghi:.2f}", f"{int(tot_ghi)}",
+        f"{avg_kt:.3f}", f"{avg_temp:.1f}", f"{max_temp:.1f}",
+        f"{avg_wind:.1f}", f"-{avg_dera}% avg",
+        f"{round(annual_total_mwh,1)}", f"{avg_cf:.1f}%",
+    ])
+
+    # Column widths — 11 columns, must sum exactly to W
+    cw11 = [
+        W*0.072, W*0.046, W*0.095, W*0.100,
+        W*0.065, W*0.082, W*0.082, W*0.075,
+        W*0.095, W*0.100, W*0.088,
+    ]
+    mo_tbl = Table(mo_data, colWidths=cw11, repeatRows=1)
+    mo_style = TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
+        ("FONTSIZE",      (0,0),(-1,0),  7),
+        ("FONTNAME",      (0,1),(-1,-2), BODY_FONT),
+        ("FONTSIZE",      (0,1),(-1,-1), 7.5),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2), [WHITE, G_PALE]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 3),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+        ("LEFTPADDING",   (0,0),(-1,-1), 4),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 4),
+        ("ALIGN",         (1,0),(-1,-1), "CENTER"),
+        # Highlight annual totals row
+        ("BACKGROUND",    (0,-1),(-1,-1), G_DARK),
+        ("TEXTCOLOR",     (0,-1),(-1,-1), WHITE),
+        ("FONTNAME",      (0,-1),(-1,-1), BOLD_FONT),
+        ("FONTSIZE",      (0,-1),(-1,-1), 7.5),
+        # Highlight peak generation month
+    ])
+    mo_tbl.setStyle(mo_style)
+    story.append(mo_tbl)
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        f"Peak generation month: "
+        f"{max(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['month']} "
+        f"({max(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['gen_mwh']:.1f} MWh)   |   "
+        f"Lowest generation month: "
+        f"{min(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['month']} "
+        f"({min(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['gen_mwh']:.1f} MWh)   |   "
+        f"Annual total: {round(annual_total_mwh,1)} MWh/yr",
+        S_note))
+    story.append(Spacer(1, 12))
+
+    # ══════════════════════════════════════════════════════════════════════════
     # SECTION 4: TECHNICAL SPECIFICATIONS
     # ══════════════════════════════════════════════════════════════════════════
     story.append(section_bar("SECTION 4 — TECHNICAL SPECIFICATIONS"))
@@ -1128,6 +1296,48 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
     k[1].metric(f"NPV ({r['life']} yr)",aed_s(r['npv']))
     k[2].metric("CO₂ offset / year",   f"{fmt(r['co2_yr'],1)} t/yr")
     k[3].metric("Households powered",  fmt(r['hh']))
+
+
+    # ── Monthly solar & generation breakdown ──────────────────────────────────
+    st.divider()
+    st.subheader("📅 Monthly solar resource & generation forecast")
+    monthly_rows = calc_monthly(climate, r['act_kwp'], r['pr'], r['degr'])
+    annual_gen_check = sum(row['gen_mwh'] for row in monthly_rows)
+
+    # Display as a clean table
+    import pandas as pd
+    df = pd.DataFrame([{
+        "Month":         row["month"],
+        "Days":          row["days"],
+        "GHI (kWh/m²/day)": row["ghi_daily"],
+        "Monthly GHI (kWh/m²)": row["ghi_total"],
+        "Clearness (Kt)":row["clearness"],
+        "Avg Temp (°C)": row["temp_avg"],
+        "Max Temp (°C)": row["temp_max"],
+        "Wind @ 50m (m/s)":row["wind_50m"],
+        "Temp Derating (%)":f"-{row['t_dera_pct']}%",
+        "Generation (MWh)":row["gen_mwh"],
+        "Capacity Factor (%)":row["cf_pct"],
+    } for row in monthly_rows])
+
+    # Add totals / averages row
+    totals = {
+        "Month": "ANNUAL",
+        "Days": 365,
+        "GHI (kWh/m²/day)": round(sum(r2["ghi_daily"] for r2 in monthly_rows)/12, 2),
+        "Monthly GHI (kWh/m²)": round(sum(r2["ghi_total"] for r2 in monthly_rows), 0),
+        "Clearness (Kt)": round(sum(r2["clearness"] for r2 in monthly_rows if r2["clearness"])/12, 3),
+        "Avg Temp (°C)": round(sum(r2["temp_avg"] for r2 in monthly_rows)/12, 1),
+        "Max Temp (°C)": round(max(r2["temp_max"] for r2 in monthly_rows), 1),
+        "Wind @ 50m (m/s)": round(sum(r2["wind_50m"] for r2 in monthly_rows if r2["wind_50m"])/12, 2),
+        "Temp Derating (%)": f"-{round(sum(float(r2['t_dera_pct']) for r2 in monthly_rows)/12, 1)}% avg",
+        "Generation (MWh)": round(annual_gen_check, 1),
+        "Capacity Factor (%)": round(sum(r2["cf_pct"] for r2 in monthly_rows)/12, 1),
+    }
+    df_total = pd.DataFrame([totals])
+    df_full  = pd.concat([df, df_total], ignore_index=True)
+    st.dataframe(df_full, use_container_width=True, hide_index=True)
+    st.caption(f"Monthly averages from NASA POWER 22-year climatology · Annual total generation: {round(annual_gen_check,1)} MWh/yr · System: {fmt(r['act_kwp'],1)} kWp at PR {r['pr']}%")
 
     # ── Technical ─────────────────────────────────────────────────────────────
     st.divider()
