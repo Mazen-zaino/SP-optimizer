@@ -524,6 +524,7 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
 # ─────────────────────────────────────────────────────────────────────────────
 # PDF GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
+
 def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
                  connected_power, power_unit, project_label, utility,
                  module_choice, mounting_choice, inverter_choice, soiling_loss,
@@ -532,396 +533,479 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
                  debt_ratio, debt_rate, carbon_price, bess_chem, net_metering):
 
     buf = io.BytesIO()
+
+    # Page width: A4 = 595pt, margins 2cm each side (56.7pt each) → usable = ~481pt
+    PAGE_W = A4[0]
+    L_MARGIN = R_MARGIN = 2 * cm
+    W = PAGE_W - L_MARGIN - R_MARGIN   # ~481 pt — NEVER use fractions of this in nested tables
+
     doc = SimpleDocTemplate(buf, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
+        leftMargin=L_MARGIN, rightMargin=R_MARGIN,
         topMargin=2.2*cm, bottomMargin=2*cm)
 
-    W = A4[0] - 4*cm   # usable width
+    # ── Colours ───────────────────────────────────────────────────────────────
+    G_DARK  = colors.HexColor("#0F6E56")
+    G_MID   = colors.HexColor("#1D9E75")
+    G_LIGHT = colors.HexColor("#E1F5EE")
+    G_PALE  = colors.HexColor("#F0FAF6")
+    AMBER   = colors.HexColor("#F5A623")
+    GR_LT   = colors.HexColor("#F8F9FA")
+    GR_MD   = colors.HexColor("#DEE2E6")
+    BLACK   = colors.HexColor("#212529")
+    GRAY6   = colors.HexColor("#666666")
+    WHITE   = colors.white
 
-    # Colours
-    GREEN_DARK  = colors.HexColor("#0F6E56")
-    GREEN_MID   = colors.HexColor("#1D9E75")
-    GREEN_LIGHT = colors.HexColor("#E1F5EE")
-    AMBER       = colors.HexColor("#F5A623")
-    GRAY_LIGHT  = colors.HexColor("#F8F9FA")
-    GRAY_MED    = colors.HexColor("#DEE2E6")
-    BLACK       = colors.HexColor("#212529")
-    WHITE       = colors.white
+    # ── Styles ────────────────────────────────────────────────────────────────
+    ss = getSampleStyleSheet()
+    def ps(nm, **kw):
+        return ParagraphStyle(nm, parent=ss["Normal"], **kw)
 
-    # Styles
-    styles = getSampleStyleSheet()
-    def sty(name,**kw):
-        s=ParagraphStyle(name,parent=styles["Normal"],**kw)
-        return s
-    S_title   = sty("T",fontSize=18,fontName="Helvetica-Bold",textColor=WHITE,leading=22)
-    S_sub     = sty("SB",fontSize=10,fontName="Helvetica",textColor=WHITE,leading=14)
-    S_h2      = sty("H2",fontSize=12,fontName="Helvetica-Bold",textColor=GREEN_DARK,spaceAfter=4)
-    S_h3      = sty("H3",fontSize=10,fontName="Helvetica-Bold",textColor=BLACK,spaceAfter=2)
-    S_body    = sty("BD",fontSize=9,fontName="Helvetica",textColor=BLACK,leading=13)
-    S_small   = sty("SM",fontSize=8,fontName="Helvetica",textColor=colors.HexColor("#666666"))
-    S_val     = sty("VL",fontSize=9,fontName="Helvetica-Bold",textColor=BLACK,alignment=TA_RIGHT)
-    S_label   = sty("LB",fontSize=8,fontName="Helvetica",textColor=colors.HexColor("#555555"))
-    S_center  = sty("CT",fontSize=9,fontName="Helvetica",alignment=TA_CENTER)
-    S_note    = sty("NT",fontSize=7.5,fontName="Helvetica-Oblique",
-                    textColor=colors.HexColor("#888888"),leading=11)
+    S_title  = ps("Tt", fontSize=18, fontName="Helvetica-Bold", textColor=WHITE, leading=22)
+    S_sub    = ps("Sb", fontSize=10, fontName="Helvetica",      textColor=WHITE, leading=14)
+    S_h2     = ps("H2", fontSize=11, fontName="Helvetica-Bold", textColor=G_DARK, spaceAfter=3)
+    S_body   = ps("Bd", fontSize=9,  fontName="Helvetica",      textColor=BLACK,  leading=13)
+    S_lbl    = ps("Lb", fontSize=8.5,fontName="Helvetica",      textColor=GRAY6)
+    S_val    = ps("Vl", fontSize=8.5,fontName="Helvetica-Bold", textColor=BLACK,  alignment=TA_RIGHT)
+    S_note   = ps("Nt", fontSize=7.5,fontName="Helvetica-Oblique", textColor=colors.HexColor("#888888"), leading=11)
+    S_footer = ps("Ft", fontSize=7,  fontName="Helvetica-Oblique", textColor=colors.HexColor("#aaaaaa"))
+    S_white  = ps("Wh", fontSize=8.5,fontName="Helvetica-Bold", textColor=WHITE,  alignment=TA_CENTER)
 
-    def table_style(header=True):
-        ts=[
-            ("BACKGROUND",(0,0),(-1,0),GREEN_DARK) if header else ("BACKGROUND",(0,0),(-1,0),GRAY_LIGHT),
-            ("TEXTCOLOR",(0,0),(-1,0),WHITE if header else BLACK),
-            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-            ("FONTSIZE",(0,0),(-1,0),8.5 if header else 8),
-            ("FONTNAME",(0,1),(-1,-1),"Helvetica"),
-            ("FONTSIZE",(0,1),(-1,-1),8.5),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
-            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-            ("TOPPADDING",(0,0),(-1,-1),4),
+    now = datetime.now().strftime("%d %B %Y")
+
+    # ── Reusable table style builders ─────────────────────────────────────────
+    def ts_header():
+        """Green header, alternating rows, grid."""
+        return TableStyle([
+            ("BACKGROUND",  (0,0),(-1,0), G_DARK),
+            ("TEXTCOLOR",   (0,0),(-1,0), WHITE),
+            ("FONTNAME",    (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",    (0,0),(-1,0), 8.5),
+            ("FONTNAME",    (0,1),(-1,-1),"Helvetica"),
+            ("FONTSIZE",    (0,1),(-1,-1), 8.5),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, GR_LT]),
+            ("GRID",        (0,0),(-1,-1), 0.3, GR_MD),
+            ("TOPPADDING",  (0,0),(-1,-1), 4),
             ("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("LEFTPADDING",(0,0),(-1,-1),6),
-            ("RIGHTPADDING",(0,0),(-1,-1),6),
-        ]
-        return TableStyle(ts)
+            ("LEFTPADDING", (0,0),(-1,-1), 6),
+            ("RIGHTPADDING",(0,0),(-1,-1), 6),
+            ("VALIGN",      (0,0),(-1,-1),"MIDDLE"),
+        ])
 
-    def kv_table(rows, col_w=None):
-        cw = col_w or [W*0.55, W*0.45]
-        data=[[Paragraph(str(k),S_label),Paragraph(str(v),S_val)] for k,v in rows]
-        t=Table(data,colWidths=cw)
+    def ts_section_header():
+        """Lighter green section header (for 2-col label/value tables)."""
+        return TableStyle([
+            ("BACKGROUND",  (0,0),(-1,0), G_MID),
+            ("TEXTCOLOR",   (0,0),(-1,0), WHITE),
+            ("FONTNAME",    (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",    (0,0),(-1,0), 8.5),
+            ("SPAN",        (0,0),(-1,0)),
+            ("ALIGN",       (0,0),(-1,0),"CENTER"),
+            ("FONTNAME",    (0,1),(-1,-1),"Helvetica"),
+            ("FONTSIZE",    (0,1),(-1,-1), 8.5),
+            ("FONTNAME",    (1,1),(1,-1),  "Helvetica-Bold"),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, GR_LT]),
+            ("GRID",        (0,0),(-1,-1), 0.3, GR_MD),
+            ("TOPPADDING",  (0,0),(-1,-1), 4),
+            ("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING", (0,0),(-1,-1), 6),
+            ("RIGHTPADDING",(0,0),(-1,-1), 6),
+            ("VALIGN",      (0,0),(-1,-1),"MIDDLE"),
+        ])
+
+    def kv_tbl(title, rows, c1=None, c2=None):
+        """Simple 2-col label/value table with a section header row. Full width."""
+        c1 = c1 or W * 0.56
+        c2 = c2 or W * 0.44
+        data = [[Paragraph(title, S_white), ""]] + \
+               [[Paragraph(str(k), S_lbl), Paragraph(str(v), S_val)] for k,v in rows]
+        t = Table(data, colWidths=[c1, c2])
+        t.setStyle(ts_section_header())
+        return t
+
+    def section_bar(title):
+        """Full-width dark green section divider bar."""
+        t = Table([[Paragraph(title, ps("SB2", fontSize=10, fontName="Helvetica-Bold",
+                                        textColor=WHITE))]],
+                  colWidths=[W])
         t.setStyle(TableStyle([
-            ("FONTNAME",(0,0),(-1,-1),"Helvetica"),
-            ("FONTSIZE",(0,0),(-1,-1),8.5),
-            ("FONTNAME",(1,0),(1,-1),"Helvetica-Bold"),
-            ("ROWBACKGROUNDS",(0,0),(-1,-1),[WHITE,GRAY_LIGHT]),
-            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+            ("BACKGROUND", (0,0),(-1,-1), G_DARK),
+            ("TOPPADDING", (0,0),(-1,-1), 7),
+            ("BOTTOMPADDING",(0,0),(-1,-1),7),
+            ("LEFTPADDING",(0,0),(-1,-1), 10),
         ]))
         return t
 
-    def section(title): return [
-        Spacer(1,8),
-        Paragraph(title, S_h2),
-        HRFlowable(width=W,thickness=0.5,color=GREEN_MID,spaceAfter=4),
-    ]
+    story = []
 
-    story=[]
-
-    # ── Cover banner ──────────────────────────────────────────────────────────
-    banner_data=[[
-        Paragraph("SP Optimizer", S_title),
-        Paragraph("Renewable Energy System Design Report", S_sub),
-    ]]
-    banner=Table(banner_data,colWidths=[W*0.55,W*0.45])
-    banner.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1),GREEN_DARK),
-        ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
-        ("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-    ]))
-    story.append(banner)
-    story.append(Spacer(1,6))
-
-    # Meta info row
-    now=datetime.now().strftime("%d %B %Y")
-    meta=[[
-        Paragraph(f"<b>Location:</b> {location_name}  ({lat:.4f}°N, {lon:.4f}°E)",S_small),
-        Paragraph(f"<b>Date:</b> {now}",S_small),
-        Paragraph(f"<b>Utility:</b> {utility}",S_small),
-    ]]
-    mt=Table(meta,colWidths=[W*0.45,W*0.25,W*0.30])
-    mt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),GREEN_LIGHT),
-        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
-        ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
-        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED)]))
-    story.append(mt)
-    story.append(Spacer(1,10))
-
-    # ── Recommended source badge ──────────────────────────────────────────────
-    badge_col={"solar":GREEN_MID,"wind":colors.HexColor("#185FA5"),"hybrid":colors.HexColor("#534AB7")}.get(r["badge"],GREEN_MID)
-    rec=Table([[Paragraph(f"Recommended: {r['source']}", sty("RC",fontSize=11,fontName="Helvetica-Bold",textColor=WHITE))]],
+    # ══════════════════════════════════════════════════════════════════════════
+    # COVER BANNER
+    # ══════════════════════════════════════════════════════════════════════════
+    # Title bar — single full-width table, safe
+    title_tbl = Table(
+        [[Paragraph("SP Optimizer", S_title)],
+         [Paragraph("Renewable Energy System Design Report — UAE Edition", S_sub)]],
         colWidths=[W])
-    rec.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),badge_col),
-        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
-        ("LEFTPADDING",(0,0),(-1,-1),10),("ROUNDEDCORNERS",[4,4,4,4])]))
-    story.append(rec)
-    story.append(Spacer(1,8))
+    title_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0),(-1,-1), G_DARK),
+        ("TOPPADDING",    (0,0),(-1,-1), 12),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 12),
+        ("LEFTPADDING",   (0,0),(-1,-1), 12),
+    ]))
+    story.append(title_tbl)
+    story.append(Spacer(1, 4))
 
-    # Summary text
+    # Meta strip — 3 equally wide columns, safe
+    col3 = W / 3
+    meta_tbl = Table([[
+        Paragraph(f"<b>Location:</b> {location_name}", S_lbl),
+        Paragraph(f"<b>Date:</b> {now}", S_lbl),
+        Paragraph(f"<b>Utility:</b> {utility}", S_lbl),
+    ]], colWidths=[col3, col3, col3])
+    meta_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), G_LIGHT),
+        ("TOPPADDING",    (0,0),(-1,-1), 5),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 5),
+        ("LEFTPADDING",   (0,0),(-1,-1), 8),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+    ]))
+    story.append(meta_tbl)
+    story.append(Spacer(1, 8))
+
+    # Recommended source badge
+    badge_col = {"solar": G_MID, "wind": colors.HexColor("#185FA5"),
+                 "hybrid": colors.HexColor("#534AB7")}.get(r["badge"], G_MID)
+    rec_tbl = Table([[Paragraph(f"Recommended system: {r['source']}",
+                                ps("RC", fontSize=11, fontName="Helvetica-Bold", textColor=WHITE))]],
+                    colWidths=[W])
+    rec_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), badge_col),
+        ("TOPPADDING",    (0,0),(-1,-1), 7),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 7),
+        ("LEFTPADDING",   (0,0),(-1,-1), 10),
+    ]))
+    story.append(rec_tbl)
+    story.append(Spacer(1, 6))
+
+    # Executive summary
     story.append(Paragraph(
-        f"Based on NASA POWER climate data (GHI {climate.get('psh','—')} kWh/m²/day, "
-        f"wind {climate.get('ws50','—')} m/s @ 50m), the optimal solution is {r['source']}. "
-        f"The {fmt(r['act_kwp'],1)} kWp system will generate {fmt(r['ann_gen_mwh'],1)} MWh/year, "
-        f"covering {r['self_s']}% of the {fmt(r['daily_kwh'],1)} kWh/day demand at "
-        f"a performance ratio of {r['pr']}%. At {int(r['tariff_aed']*100)} fils/kWh, "
-        f"the project achieves a {r['payback']}-year payback and {r['irr']}% IRR over {r['life']} years.",
+        f"Based on NASA POWER climate data ({climate.get('psh','—')} kWh/m²/day GHI, "
+        f"{climate.get('ws50','—')} m/s wind at 50m), {r['source']} is the optimal system for "
+        f"{location_name}. The {fmt(r['act_kwp'],1)} kWp system generates {fmt(r['ann_gen_mwh'],1)} MWh/yr, "
+        f"covering {r['self_s']}% of the {fmt(r['daily_kwh'],1)} kWh/day demand at a performance ratio of "
+        f"{r['pr']}%. At {int(r['tariff_aed']*100)} fils/kWh ({utility}), "
+        f"the project achieves a {r['payback']}-year simple payback and {r['irr']}% IRR over {r['life']} years.",
         S_body))
-    story.append(Spacer(1,10))
+    story.append(Spacer(1, 10))
 
-    # ── AREA SECTION (prominent) ──────────────────────────────────────────────
-    story += section("📐 REQUIRED SITE AREA")
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1: REQUIRED SITE AREA
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 1 — REQUIRED SITE AREA FOR IMPLEMENTATION"))
+    story.append(Spacer(1, 5))
 
-    area_data=[
-        ["Parameter","Value","Notes"],
-        ["PV module active area",f"{fmt(r['panel_m2'],1)} m²","Physical area of all PV panels"],
-        ["Array footprint (GCR = {:.2f})".format(r['gcr']),f"{fmt(r['array_m2'],1)} m²","Panel area ÷ ground cover ratio"],
-        ["Land buffer factor",f"{MOUNTING_TYPES[mounting_choice]['land_buffer']}×","Access roads, inverter pads, fencing"],
-        ["Site setback / unusable",f"{setback_pct}%","Excluded from usable area"],
-        ["TOTAL SITE AREA REQUIRED",f"{fmt(r['site_m2'],0)} m²","MINIMUM land to implement the system"],
-        ["In hectares",f"{fmt(r['site_ha'],3)} ha","1 ha = 10,000 m²"],
-        ["Area per kWp (array)",f"{fmt(r['arr_m2_kwp'],1)} m²/kWp","Array footprint per kWp installed"],
-        ["Area per kWp (total site)",f"{fmt(r['site_m2_kwp'],1)} m²/kWp","Total site per kWp installed"],
+    # Big area highlight row — 5 equal columns
+    col5 = W / 5
+    area_highlight = Table(
+        [[Paragraph(f"{fmt(r['panel_m2'],0)} m²",   ps("AV1",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['array_m2'],0)} m²",   ps("AV2",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_m2'],0)} m²",    ps("AV3",fontSize=18,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_ha'],3)} ha",     ps("AV4",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_m2_kwp'],1)} m²/kWp",ps("AV5",fontSize=14,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+         ],
+         [Paragraph("Panel active area",   ps("AL1",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
+          Paragraph("Array footprint",     ps("AL2",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
+          Paragraph("TOTAL SITE REQUIRED", ps("AL3",fontSize=7.5,fontName="Helvetica-Bold",textColor=AMBER,alignment=TA_CENTER)),
+          Paragraph("In hectares",         ps("AL4",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
+          Paragraph("Area per kWp",        ps("AL5",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
+         ]],
+        colWidths=[col5, col5, col5, col5, col5])
+    area_highlight.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), G_DARK),
+        ("TOPPADDING",    (0,0),(-1,-1), 10),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 8),
+        ("LEFTPADDING",   (0,0),(-1,-1), 4),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 4),
+        ("LINEAFTER",     (0,0),(3,1),   0.5, colors.HexColor("#1D9E75")),
+        ("BACKGROUND",    (2,0),(2,1),   colors.HexColor("#085041")),  # highlight total
+    ]))
+    story.append(area_highlight)
+    story.append(Spacer(1, 6))
+
+    # Area breakdown table
+    area_rows = [
+        ["Parameter", "Value", "Explanation"],
+        ["PV module active area",        f"{fmt(r['panel_m2'],1)} m²",   f"{fmt(r['num_pan'])} panels x {round(r['panel_m2']/r['num_pan'] if r['num_pan'] else 0,2)} m² each"],
+        ["Ground cover ratio (GCR)",     f"{r['gcr']}",                  f"{int(r['gcr']*100)}% of ground covered by panels — {mounting_choice.split('—')[0].strip()}"],
+        ["Array footprint (panel/GCR)",  f"{fmt(r['array_m2'],1)} m²",   "Minimum ground area for the panel array"],
+        ["Land buffer factor",           f"{MOUNTING_TYPES[mounting_choice]['land_buffer']}x", "Roads, inverter pads, fencing, fire clearance"],
+        ["Site setback / unusable",      f"{setback_pct}%",              "Excluded from usable site area"],
+        ["TOTAL SITE AREA REQUIRED",     f"{fmt(r['site_m2'],0)} m²",    "Minimum land area needed to install the system"],
+        ["In hectares",                  f"{fmt(r['site_ha'],3)} ha",     "1 hectare = 10,000 m²"],
+        ["Array area per kWp",           f"{fmt(r['arr_m2_kwp'],1)} m²/kWp", "Array footprint per kWp of installed capacity"],
+        ["Total site per kWp",           f"{fmt(r['site_m2_kwp'],1)} m²/kWp","Total site per kWp installed"],
     ]
-    if avail_m2 and avail_m2>0:
-        area_data.append(["Available area entered",f"{fmt(avail_m2,0)} m²","Provided by user"])
-        if not r["area_ok"]:
-            area_data.append(["⚠ Area feasibility",f"INSUFFICIENT — max {fmt(r['max_kwp_area'],0)} kWp fits","Increase area or use higher-efficiency module"])
-        else:
-            area_data.append(["Area feasibility","✓ SUFFICIENT","System fits within available area"])
+    if avail_m2 and avail_m2 > 0:
+        feasible = "SUFFICIENT — system fits" if r["area_ok"] else f"INSUFFICIENT — max {fmt(r['max_kwp_area'],0)} kWp fits"
+        area_rows.append(["Available area (entered)",  f"{fmt(avail_m2,0)} m²", "Provided by user"])
+        area_rows.append(["Area feasibility check",    feasible,                "Based on GCR and setbacks"])
 
-    at=Table(area_data,colWidths=[W*0.40,W*0.25,W*0.35])
-    ts2=TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),GREEN_DARK),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),8.5),
-        ("FONTNAME",(0,1),(-1,-1),"Helvetica"),("FONTSIZE",(0,1),(-1,-1),8.5),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
-        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
-        # Highlight total row
-        ("BACKGROUND",(0,5),(-1,5),colors.HexColor("#D4EDDA")),
-        ("FONTNAME",(0,5),(-1,5),"Helvetica-Bold"),
-        ("FONTSIZE",(0,5),(-1,5),9),
-        ("BACKGROUND",(0,6),(-1,6),colors.HexColor("#D4EDDA")),
-        ("FONTNAME",(0,6),(-1,6),"Helvetica-Bold"),
-    ])
-    at.setStyle(ts2)
+    at = Table(area_rows, colWidths=[W*0.38, W*0.22, W*0.40])
+    at.setStyle(ts_header())
+    # Highlight the "TOTAL SITE AREA" row (row index 6)
+    at.setStyle(TableStyle(list(ts_header()._cmds) + [
+        ("BACKGROUND",  (0,6),(-1,6), G_PALE),
+        ("FONTNAME",    (0,6),(-1,6), "Helvetica-Bold"),
+        ("BACKGROUND",  (0,7),(-1,7), G_PALE),
+        ("FONTNAME",    (0,7),(-1,7), "Helvetica-Bold"),
+    ]))
     story.append(at)
-    story.append(Spacer(1,4))
+    story.append(Spacer(1, 4))
     story.append(Paragraph(
-        f"Mounting: {mounting_choice.split('—')[0].strip()}  ·  "
-        f"Modules: {num_pan_global} × {MODULE_SPECS[module_choice]['wp']} Wp ({module_choice.split(' (')[0]})  ·  "
-        f"GCR: {r['gcr']}",S_note))
-    story.append(Spacer(1,10))
+        f"Mounting: {mounting_choice}   |   "
+        f"Module: {module_choice}   |   GCR: {r['gcr']}   |   "
+        f"Setback: {setback_pct}%", S_note))
+    story.append(Spacer(1, 12))
 
-    # ── KPI summary table ─────────────────────────────────────────────────────
-    story += section("📊 KEY PERFORMANCE INDICATORS")
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2: KPI SUMMARY
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 2 — KEY PERFORMANCE INDICATORS"))
+    story.append(Spacer(1, 5))
 
-    kpi_rows=[
-        ["Indicator","Value","Indicator","Value"],
-        ["Renewable capacity",f"{fmt(r['act_kwp'],1)} kWp","Self-sufficiency",f"{r['self_s']}%"],
-        ["Annual generation",f"{fmt(r['ann_gen_mwh'],1)} MWh/yr","Capacity factor",f"{r['cap_f']}%"],
-        ["Specific yield",f"{fmt(r['spec_yld'],0)} kWh/kWp/yr","Performance ratio (PR)",f"{r['pr']}%"],
-        ["Total CAPEX",aed_s(r['total_cap']),"CAPEX per Wp",f"AED {r['cap_wp']:.2f}/Wp"],
-        ["LCOE",f"AED {r['lcoe']:.0f}/MWh ({r['lcoe']/10:.1f} fils/kWh)","Tariff (avoided cost)",f"{int(r['tariff_aed']*100)} fils/kWh"],
-        ["Simple payback",f"{r['payback']} years","Project IRR",f"{r['irr']}%" if r['irr'] else "—"],
-        [f"NPV ({r['life']} yr)",aed_s(r['npv']),"Equity IRR",f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
-        ["CO₂ offset / year",f"{fmt(r['co2_yr'],1)} tonnes/yr","Households powered",fmt(r['hh'])],
-        ["Site area required",f"{fmt(r['site_m2'],0)} m²  ({fmt(r['site_ha'],3)} ha)","Panels required",fmt(r['num_pan'])],
+    kpi_data = [
+        ["Indicator",           "Value",                             "Indicator",          "Value"],
+        ["Renewable capacity",  f"{fmt(r['act_kwp'],1)} kWp",        "Self-sufficiency",   f"{r['self_s']}%"],
+        ["Annual generation",   f"{fmt(r['ann_gen_mwh'],1)} MWh/yr", "Capacity factor",    f"{r['cap_f']}%"],
+        ["Specific yield",      f"{fmt(r['spec_yld'],0)} kWh/kWp/yr","Performance ratio",  f"{r['pr']}%"],
+        ["Total CAPEX",         aed_s(r['total_cap']),                "CAPEX per Wp",       f"AED {r['cap_wp']:.2f}"],
+        ["LCOE",                f"AED {r['lcoe']:.0f}/MWh",          "Tariff (avoided)",   f"{int(r['tariff_aed']*100)} fils/kWh"],
+        ["Simple payback",      f"{r['payback']} years",             "Project IRR",        f"{r['irr']}%" if r['irr'] else "—"],
+        [f"NPV ({r['life']} yr)", aed_s(r['npv']),                   "Equity IRR",         f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
+        ["CO2 offset/year",     f"{fmt(r['co2_yr'],1)} tonnes/yr",   "Households powered", fmt(r['hh'])],
+        ["Total site required", f"{fmt(r['site_m2'],0)} m²",         "Panels required",    fmt(r['num_pan'])],
     ]
-    kt=Table(kpi_rows,colWidths=[W*0.28,W*0.22,W*0.28,W*0.22])
-    kt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),GREEN_DARK),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),8.5),
-        ("BACKGROUND",(2,1),(-1,-1),colors.HexColor("#F0FAF6")),
-        ("FONTNAME",(0,1),(-1,-1),"Helvetica"),("FONTSIZE",(0,1),(-1,-1),8.5),
-        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
-        ("FONTNAME",(3,1),(3,-1),"Helvetica-Bold"),
-        ("ROWBACKGROUNDS",(0,1),(1,-1),[WHITE,GRAY_LIGHT]),
-        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+    col4 = [W*0.30, W*0.20, W*0.30, W*0.20]
+    kpi_tbl = Table(kpi_data, colWidths=col4)
+    kpi_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0),(-1,0),  8.5),
+        ("FONTNAME",      (0,1),(-1,-1), "Helvetica"),
+        ("FONTSIZE",      (0,1),(-1,-1), 8.5),
+        ("FONTNAME",      (1,1),(1,-1),  "Helvetica-Bold"),
+        ("FONTNAME",      (3,1),(3,-1),  "Helvetica-Bold"),
+        ("BACKGROUND",    (2,1),(-1,-1), GR_LT),
+        ("ROWBACKGROUNDS",(0,1),(1,-1),  [WHITE, colors.HexColor("#F5FBF8")]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 5),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 5),
+        ("LEFTPADDING",   (0,0),(-1,-1), 6),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 6),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
     ]))
-    story.append(kt)
-    story.append(Spacer(1,10))
+    story.append(kpi_tbl)
+    story.append(Spacer(1, 12))
 
-    # ── Climate data ──────────────────────────────────────────────────────────
-    story += section("🛰️ CLIMATE DATA")
-    src_note = "NASA POWER Climatology API (2001–2022, 22-year average)"
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3: CLIMATE DATA
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 3 — CLIMATE & SOLAR RESOURCE DATA"))
+    story.append(Spacer(1, 5))
+    src_txt = "NASA POWER Climatology API (2001–2022, 22-year average)"
     if pvgis_data and pvgis_data.get("yield_kwh_yr"):
-        src_note += "  ·  PVGIS 5.2 EU JRC (yield cross-check)"
-    story.append(Paragraph(f"Source: {src_note}", S_note))
-    story.append(Spacer(1,4))
+        src_txt += "   |   PVGIS 5.2 EU Joint Research Centre (yield cross-check)"
+    story.append(Paragraph(f"Sources: {src_txt}", S_note))
+    story.append(Spacer(1, 4))
 
-    crows=[
-        ["Parameter","Value","Parameter","Value"],
-        ["Daily GHI",f"{climate.get('psh','—')} kWh/m²/day","Annual GHI",f"{climate.get('ghi_annual','—')} kWh/m²/yr"],
-        ["Peak sun hours",f"{climate.get('psh','—')} hrs/day","Clearness index (Kt)",str(climate.get('clearness','—'))],
-        ["Wind speed @ 50m",f"{climate.get('ws50','—')} m/s","Wind speed @ 80m",f"{climate.get('ws80','—')} m/s"],
-        ["Avg temperature",f"{climate.get('temp','—')} °C","Max temperature",f"{climate.get('temp_max','—')} °C"],
-        ["Avg humidity",f"{climate.get('humidity','—')} %","PVGIS yield check",
-         f"{fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "Not available"],
+    clim_data = [
+        ["Parameter",            "Value",                          "Parameter",          "Value"],
+        ["Location",             location_name,                    "Coordinates",        f"{lat:.4f}N, {lon:.4f}E"],
+        ["Daily GHI (PSH)",      f"{climate.get('psh','—')} kWh/m2/day", "Annual GHI", f"{climate.get('ghi_annual','—')} kWh/m2/yr"],
+        ["Clear-sky GHI",        f"{climate.get('clear_sky','—')} kWh/m2/day","Clearness index (Kt)", str(climate.get('clearness','—'))],
+        ["Wind speed @ 50m",     f"{climate.get('ws50','—')} m/s","Wind speed @ 10m",   f"{climate.get('ws10','—')} m/s"],
+        ["Avg temperature",      f"{climate.get('temp','—')} C",   "Max temperature",   f"{climate.get('temp_max','—')} C"],
+        ["Min temperature",      f"{climate.get('temp_min','—')} C","Avg humidity",      f"{climate.get('humidity','—')} %"],
+        ["PVGIS yield check",    f"{fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "Not available",
+         "PVGIS total losses",   f"{pvgis_data.get('loss_pct','—')}%" if pvgis_data else "—"],
     ]
-    ct=Table(crows,colWidths=[W*0.28,W*0.22,W*0.28,W*0.22])
-    ct.setStyle(table_style())
-    story.append(ct)
-    story.append(Spacer(1,10))
-
-    # ── Technical specs ───────────────────────────────────────────────────────
-    story += section("⚙️ TECHNICAL SPECIFICATIONS")
-
-    # PV module
-    pv_rows=[
-        ["PV Module & System",""],
-        ["Module technology",module_choice.split(" (")[0]],
-        ["Module wattage",f"{MODULE_SPECS[module_choice]['wp']} Wp"],
-        ["Module efficiency",f"{MODULE_SPECS[module_choice]['eff']*100:.1f}%"],
-        ["Temp. coefficient",f"{MODULE_SPECS[module_choice]['temp_coef']*100:.3f}%/°C"],
-        ["Number of panels",fmt(r['num_pan'])],
-        ["DC system capacity",f"{fmt(r['act_kwp'],1)} kWp"],
-        ["Mounting system",mounting_choice],
-        ["GCR",f"{r['gcr']}  ({int(r['gcr']*100)}% ground coverage)"],
-        ["Panel orientation",azimuth],
-        ["Fixed tilt angle",f"{tilt_angle}°"],
-        ["Soiling loss",f"{soiling_loss}%"],
-        ["Ground albedo",f"{ground_albedo}%"],
-        ["Cell temp (avg operating)",f"{r['cell_temp']}°C"],
-        ["Temp. derating vs STC",f"−{r['temp_dera']}%"],
-        ["Bifacial / albedo gain",f"+{r['bifacial_g']}%" if r['bifacial_g']>0 else "N/A"],
-        ["Performance ratio (PR)",f"{r['pr']}%"],
-        ["Specific yield",f"{fmt(r['spec_yld'],0)} kWh/kWp/yr"],
-        ["Annual degradation",f"{r['degr']}%/yr"],
-    ]
-    pv_t=Table(pv_rows,colWidths=[W*0.55,W*0.45])
-    pv_t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
-        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
-        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
-        ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
+    clim_tbl = Table(clim_data, colWidths=col4)
+    clim_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0),(-1,-1), 8.5),
+        ("FONTNAME",      (0,1),(-1,-1), "Helvetica"),
+        ("FONTNAME",      (1,1),(1,-1),  "Helvetica-Bold"),
+        ("FONTNAME",      (3,1),(3,-1),  "Helvetica-Bold"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 4),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 4),
+        ("LEFTPADDING",   (0,0),(-1,-1), 6),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 6),
     ]))
+    story.append(clim_tbl)
+    story.append(Spacer(1, 12))
 
-    # Inverter & BESS
-    inv_rows=[["Inverter & BESS",""],
-        ["Inverter type",inverter_choice.split("(")[0].strip()],
-        ["Inverter efficiency",f"{INVERTER_TYPES[inverter_choice]['eff']*100:.1f}%"],
-        ["Grid connection",grid_type],
-        ["Net metering","Yes" if r['net_metering'] else "No"],
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 4: TECHNICAL SPECIFICATIONS
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 4 — TECHNICAL SPECIFICATIONS"))
+    story.append(Spacer(1, 5))
+
+    c55 = W * 0.55
+    c45 = W * 0.45
+
+    # PV module table
+    panel_tech = module_choice.split(" (")[0]
+    tracker_note = mounting_choice.split("—")[0].strip()
+    pvgis_src = f"PVGIS JRC: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "NASA POWER model"
+    story.append(kv_tbl("PV MODULE & SOLAR SYSTEM", [
+        ("Module technology",        panel_tech),
+        ("Module wattage",           f"{MODULE_SPECS[module_choice]['wp']} Wp"),
+        ("Module efficiency",        f"{MODULE_SPECS[module_choice]['eff']*100:.1f}%"),
+        ("Temp. coefficient (Pmax)", f"{MODULE_SPECS[module_choice]['temp_coef']*100:.3f}%/C"),
+        ("Number of panels",         fmt(r['num_pan'])),
+        ("DC system capacity",       f"{fmt(r['act_kwp'],1)} kWp"),
+        ("Mounting system",          tracker_note),
+        ("Ground cover ratio (GCR)", f"{r['gcr']}  ({int(r['gcr']*100)}% ground coverage)"),
+        ("Panel orientation",        azimuth),
+        ("Fixed tilt angle",         f"{tilt_angle} degrees"),
+        ("Soiling loss assumed",      f"{soiling_loss}%"),
+        ("Operating cell temp (avg)",f"{r['cell_temp']} C"),
+        ("Temperature derating",     f"-{r['temp_dera']}% vs nameplate (STC)"),
+        ("Bifacial/albedo gain",     f"+{r['bifacial_g']}%" if r['bifacial_g'] > 0 else "N/A"),
+        ("Performance ratio (PR)",   f"{r['pr']}%"),
+        ("Specific yield",           f"{fmt(r['spec_yld'],0)} kWh/kWp/yr"),
+        ("Annual degradation",       f"{r['degr']}%/yr"),
+        ("Generation data source",   pvgis_src),
+    ], c55, c45))
+    story.append(Spacer(1, 6))
+
+    # Inverter & grid table
+    inv_rows_data = [
+        ("Inverter type",     inverter_choice.split("(")[0].strip()),
+        ("Inverter efficiency",f"{INVERTER_TYPES[inverter_choice]['eff']*100:.1f}%"),
+        ("Grid connection",   grid_type),
+        ("Net metering",      "Yes — available" if r['net_metering'] else "No"),
     ]
-    if r['bess_kwh']>0:
-        inv_rows+=[
-            ["Battery chemistry",bess_chem],
-            ["BESS capacity",f"{fmt(r['bess_kwh'],1)} kWh"],
-            ["BESS power",f"{fmt(r['bess_kw'],1)} kW"],
-            ["BESS duration",f"{r['bess_h']} hours"],
-            ["BESS CAPEX",aed_s(r['bess_cap_aed'])],
+    if r['bess_kwh'] > 0:
+        inv_rows_data += [
+            ("Battery chemistry",  bess_chem),
+            ("BESS total capacity",f"{fmt(r['bess_kwh'],1)} kWh"),
+            ("BESS power rating",  f"{fmt(r['bess_kw'],1)} kW"),
+            ("BESS duration",      f"{r['bess_h']} hours"),
+            ("Round-trip efficiency","92-95%"),
+            ("Cycle life",         "4,000-6,000 cycles (LFP)"),
+            ("BESS CAPEX",         aed_s(r['bess_cap_aed'])),
         ]
-    iv_t=Table(inv_rows,colWidths=[W*0.55,W*0.45])
-    iv_t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
-        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
-        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
-        ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
-    ]))
+    story.append(kv_tbl("INVERTER, GRID & BESS", inv_rows_data, c55, c45))
+    story.append(Spacer(1, 12))
 
-    side=Table([[pv_t,Spacer(0.3*cm,1),iv_t]],colWidths=[W*0.52,0.3*cm,W*0.48])
-    side.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story.append(side)
-    story.append(Spacer(1,10))
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5: FINANCIAL ANALYSIS
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 5 — FINANCIAL ANALYSIS (AED)"))
+    story.append(Spacer(1, 5))
 
-    # ── Financial ─────────────────────────────────────────────────────────────
-    story += section("💰 FINANCIAL ANALYSIS (AED)")
-
-    fin_l=[["Capital expenditure",""],
-        ["Total CAPEX",aed_s(r['total_cap'])],
-        ["CAPEX per Wp",f"AED {r['cap_wp']:.2f}/Wp"],
-    ]+[[f"  {k}",f"{v}%"] for k,v in r['cb'].items() if v>0]+[
-        ["Equity required",aed_s(r['eq_aed'])],
-        ["Project debt",aed_s(r['dbt_aed'])],
-        ["Annual O&M",aed_s(r['ann_opex'])],
+    # CAPEX breakdown
+    capex_rows = [
+        ("Total CAPEX",          aed_s(r['total_cap'])),
+        ("CAPEX per Wp",         f"AED {r['cap_wp']:.2f}/Wp"),
+    ] + [(f"  {k}", f"{v}%") for k, v in r['cb'].items() if v > 0] + [
+        ("Equity required",      aed_s(r['eq_aed'])),
+        ("Project debt",         aed_s(r['dbt_aed'])),
+        ("Debt ratio",           f"{r['debt_ratio']}%"),
+        ("Debt interest rate",   f"{r['debt_rate']}%"),
+        ("Annual O&M cost",      aed_s(r['ann_opex'])),
     ]
-    fin_r=[["Financial returns",""],
-        ["Tariff",f"{int(r['tariff_aed']*100)} fils/kWh"],
-        ["Year-1 gross revenue",aed_s(r['y1rev'])],
-        ["Year-1 net income",aed_s(r['y1net'])],
-        ["LCOE",f"AED {r['lcoe']:.0f}/MWh ({r['lcoe']/10:.1f} fils/kWh)"],
-        ["Simple payback",f"{r['payback']} years"],
-        ["Project IRR",f"{r['irr']}%" if r['irr'] else "—"],
-        ["Equity IRR",f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
-        [f"NPV ({r['life']} yr, {r['wacc']}% WACC)",aed_s(r['npv'])],
-        ["DSCR (year 1)",f"{r['dscr']}×" if r['dscr'] else "N/A"],
-        ["Annual debt service",aed_s(r['ann_ds']) if r['ann_ds']>0 else "—"],
-        ["Carbon credit revenue",f"{aed_s(r['co2_rev'])}/yr"],
-    ]
-    def make_2col(rows):
-        t=Table(rows,colWidths=[W*0.52/1.0*0.55,W*0.52/1.0*0.45])
-        t.setStyle(TableStyle([
-            ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
-            ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
-            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
-            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
-            ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
-        ]))
-        return t
-    fin_side=Table([[make_2col(fin_l),Spacer(0.3*cm,1),make_2col(fin_r)]],
-        colWidths=[W*0.48,0.3*cm,W*0.52-0.3*cm])
-    fin_side.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story.append(fin_side)
-    story.append(Spacer(1,10))
+    story.append(kv_tbl("CAPITAL EXPENDITURE BREAKDOWN", capex_rows, c55, c45))
+    story.append(Spacer(1, 6))
 
-    # ── Sustainability ────────────────────────────────────────────────────────
-    story += section("🌱 SUSTAINABILITY & ENVIRONMENTAL IMPACT")
-    sus_rows=[
-        ["CO₂ avoided per year",f"{fmt(r['co2_yr'],1)} tonnes/yr"],
-        [f"CO₂ avoided over {r['life']} years",f"{fmt(r['co2_lf'],0)} tonnes"],
-        ["UAE households powered per year",fmt(r['hh'])],
-        ["Carbon credit value",f"{aed_s(r['co2_rev'])}/yr (at AED {carbon_price:.0f}/tonne)"],
-        ["Grid emission factor","0.341 kgCO₂/kWh (DEWA Clean Energy Report 2023)"],
-        ["UAE Net Zero alignment","Supports UAE 2050 Net Zero Strategy & 44% clean energy target by 2050"],
-        ["SDG alignment","SDG 7 (Clean Energy)  ·  SDG 11 (Sustainable Cities)  ·  SDG 13 (Climate Action)"],
+    # Financial returns
+    returns_rows = [
+        ("Electricity tariff (avoided cost)", f"{int(r['tariff_aed']*100)} fils/kWh"),
+        ("Year-1 gross revenue",   aed_s(r['y1rev'])),
+        ("Year-1 net income",      aed_s(r['y1net'])),
+        ("LCOE",                   f"AED {r['lcoe']:.0f}/MWh  ({r['lcoe']/10:.1f} fils/kWh)"),
+        ("Simple payback period",  f"{r['payback']} years"),
+        ("Project IRR",            f"{r['irr']}%" if r['irr'] else "—"),
+        ("Equity IRR",             f"{r['eq_irr']}%" if r['eq_irr'] else "—"),
+        (f"NPV ({r['life']} yr, {r['wacc']}% WACC)", aed_s(r['npv'])),
+        ("DSCR (year 1)",          f"{r['dscr']}x" if r['dscr'] else "N/A (no debt)"),
+        ("Annual debt service",    aed_s(r['ann_ds']) if r['ann_ds'] > 0 else "—"),
+        ("Carbon credit revenue",  f"{aed_s(r['co2_rev'])}/yr  (at AED {carbon_price:.0f}/tonne)"),
     ]
-    story.append(kv_table(sus_rows,[W*0.50,W*0.50]))
-    story.append(Spacer(1,10))
+    story.append(kv_tbl("FINANCIAL RETURNS", returns_rows, c55, c45))
+    story.append(Spacer(1, 12))
 
-    # ── Risks & next steps ────────────────────────────────────────────────────
-    story += section("⚠️ KEY RISKS & MITIGATIONS")
-    risk_rows=[
-        ["Risk","Mitigation"],
-        ["Soiling & dust (UAE desert)","Bi-weekly dry cleaning or robotic auto-cleaning system"],
-        [f"High cell temperature ({r['cell_temp']}°C operating)","Specify TOPCon/HJT with temp. coeff. ≤−0.30%/°C"],
-        ["Grid curtailment by DEWA/SEWA","Include active power control in inverter spec; consider BESS"],
-        ["Tariff / regulatory risk","Lock in net metering agreement or PPA before financial close"],
-        ["Sand abrasion on AR coating","Specify anti-soiling glass; IEC 61215 / IP67 rated junction boxes"],
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 6: SUSTAINABILITY
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 6 — SUSTAINABILITY & ENVIRONMENTAL IMPACT"))
+    story.append(Spacer(1, 5))
+    story.append(kv_tbl("ENVIRONMENTAL METRICS", [
+        ("CO2 avoided per year",            f"{fmt(r['co2_yr'],1)} tonnes/yr"),
+        (f"CO2 avoided over {r['life']} years", f"{fmt(r['co2_lf'],0)} tonnes"),
+        ("UAE households powered / year",   fmt(r['hh'])),
+        ("Carbon credit value",             f"{aed_s(r['co2_rev'])}/yr"),
+        ("Grid emission factor",            "0.341 kgCO2/kWh  (DEWA Clean Energy Report 2023)"),
+        ("UAE Net Zero alignment",          "Supports UAE 2050 Net Zero & 44% clean energy target"),
+        ("SDG alignment",                   "SDG 7 (Clean Energy), SDG 11 (Sustainable Cities), SDG 13 (Climate Action)"),
+    ], c55, c45))
+    story.append(Spacer(1, 12))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 7: RISKS & NEXT STEPS
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 7 — KEY RISKS & MITIGATIONS"))
+    story.append(Spacer(1, 5))
+
+    risk_data = [
+        ["Risk",                                            "Mitigation"],
+        ["Soiling & dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
+        [f"High cell temperature ({r['cell_temp']}C avg operating)", "Specify TOPCon/HJT modules with temp. coeff. below -0.30%/C"],
+        ["Grid curtailment by DEWA/SEWA",                  "Include active power control in inverter spec; evaluate BESS for peak shifting"],
+        ["Tariff / regulatory change",                     "Lock in net metering agreement or long-term PPA before financial close"],
+        ["Sand abrasion on anti-reflective coating",       "Specify IEC 61215 / IP67 rated modules with hardened AR glass"],
     ]
-    rkt=Table(risk_rows,colWidths=[W*0.40,W*0.60])
-    rkt.setStyle(table_style())
-    story.append(rkt)
-    story.append(Spacer(1,10))
+    risk_tbl = Table(risk_data, colWidths=[W*0.42, W*0.58])
+    risk_tbl.setStyle(ts_header())
+    story.append(risk_tbl)
+    story.append(Spacer(1, 10))
 
-    story += section("✅ RECOMMENDED NEXT STEPS")
-    steps=[
-        f"Submit interconnection / net metering application to {utility.split('(')[0].strip()} (Shams Dubai portal for DEWA)",
-        f"Commission bankable P50/P90 energy yield assessment for {location_name} — required for project finance",
-        f"Appoint DEWA/Trakhees-approved EPC contractor; obtain No Objection Certificate (NOC)",
-        f"Confirm site land availability: {fmt(r['site_m2'],0)} m² ({fmt(r['site_ha'],2)} ha) minimum required",
-        f"Develop lender-ready financial model using P90 scenario — target DSCR ≥ 1.20× (current estimate: {r['dscr']}×)" if r['dscr'] else "Develop lender-ready financial model with P90 scenario",
+    story.append(section_bar("SECTION 8 — RECOMMENDED NEXT STEPS"))
+    story.append(Spacer(1, 6))
+    util_short = utility.split("(")[0].strip()
+    steps = [
+        f"Submit interconnection / net metering application to {util_short} (Shams Dubai portal for DEWA projects)",
+        f"Commission bankable P50/P90 energy yield assessment for {location_name} — required for project financing at {aed_s(r['total_cap'])} scale",
+        f"Appoint DEWA/Trakhees-approved EPC contractor and obtain No Objection Certificate (NOC) from relevant authority",
+        f"Confirm site land availability: minimum {fmt(r['site_m2'],0)} m2 ({fmt(r['site_ha'],2)} ha) required for this system",
+        f"Develop lender-ready financial model using P90 scenario — target DSCR of 1.20x or above (current model: {r['dscr']}x)" if r['dscr'] else "Develop lender-ready financial model using P90 generation scenario",
     ]
-    for i,s in enumerate(steps,1):
-        story.append(Paragraph(f"{i}.  {s}", S_body))
-        story.append(Spacer(1,3))
-    story.append(Spacer(1,8))
+    for i, step in enumerate(steps, 1):
+        story.append(Paragraph(f"{i}.   {step}", S_body))
+        story.append(Spacer(1, 4))
 
-    # ── Footer note ───────────────────────────────────────────────────────────
-    story.append(HRFlowable(width=W,thickness=0.5,color=GRAY_MED))
-    story.append(Spacer(1,4))
+    story.append(Spacer(1, 8))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(HRFlowable(width=W, thickness=0.5, color=GR_MD))
+    story.append(Spacer(1, 4))
+    footer_src = "NASA POWER API (2001-2022)"
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        footer_src += "  |  PVGIS 5.2 EU JRC"
     story.append(Paragraph(
-        f"Report generated: {now}  ·  Climate data: NASA POWER API (2001–2022)"
-        + ("  ·  PVGIS 5.2 JRC" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "")
-        + "  ·  Tariffs: DEWA/SEWA/FEWA 2024  ·  SP Optimizer UAE Edition",
-        sty("FT",fontSize=7,fontName="Helvetica-Oblique",textColor=colors.HexColor("#aaaaaa"))))
+        f"Report generated: {now}   |   Climate data: {footer_src}"
+        f"   |   Tariffs: DEWA/SEWA/FEWA 2024   |   SP Optimizer UAE Edition",
+        S_footer))
 
     doc.build(story)
     buf.seek(0)
     return buf
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT DISPLAY RENDERER
