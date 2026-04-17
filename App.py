@@ -231,14 +231,24 @@ def geocode(name):
     return None
 
 def rev_geocode(lat,lon):
+    """Reverse geocode with English language preference to avoid Arabic/non-Latin names."""
     try:
         r = requests.get("https://nominatim.openstreetmap.org/reverse",
-            params={"lat":lat,"lon":lon,"format":"json"},
-            headers={"User-Agent":"SPOptimizer/2.0"}, timeout=10)
-        addr = r.json().get("address",{})
-        parts=[addr[k] for k in ["suburb","city","town","state","country"] if addr.get(k)]
-        return ", ".join(parts[:3]) if parts else f"{lat:.3f},{lon:.3f}"
-    except: return f"{lat:.4f},{lon:.4f}"
+            params={"lat":lat,"lon":lon,"format":"json","accept-language":"en"},
+            headers={"User-Agent":"SPOptimizer/2.0","Accept-Language":"en"}, timeout=10)
+        data = r.json()
+        addr = data.get("address",{})
+        # Prefer English name fields
+        parts=[addr[k] for k in ["suburb","city","town","village","state","country"] if addr.get(k)]
+        name = ", ".join(parts[:3]) if parts else ""
+        # If still non-Latin (Arabic etc.), fall back to display_name english portion or coords
+        if name and any(ord(c) > 1000 for c in name):
+            # Try display_name which sometimes has English
+            dn = data.get("display_name","")
+            latin_parts = [p.strip() for p in dn.split(",") if p.strip() and not any(ord(c)>1000 for c in p)]
+            name = ", ".join(latin_parts[-3:]) if latin_parts else f"Site ({lat:.4f}N, {lon:.4f}E)"
+        return name if name else f"Site ({lat:.4f}N, {lon:.4f}E)"
+    except: return f"Site ({lat:.4f}N, {lon:.4f}E)"
 
 def fetch_nasa(lat, lon):
     """
@@ -527,6 +537,29 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
 # PDF GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
+def safe_pdf_text(text):
+    """
+    Make text safe for ReportLab PDF rendering.
+    Handles Arabic / RTL text using arabic-reshaper + python-bidi if available.
+    Falls back to coordinate-style label if libraries are missing.
+    """
+    if not text:
+        return text
+    # Check if text contains Arabic/RTL characters (Unicode range 0x0600-0x06FF)
+    has_arabic = any(0x0600 <= ord(c) <= 0x06FF for c in text)
+    if not has_arabic:
+        return text
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    except ImportError:
+        # Libraries not installed — strip Arabic, keep any Latin parts
+        latin = " ".join(p.strip() for p in text.split() if not any(0x0600<=ord(c)<=0x06FF for c in p))
+        return latin.strip() if latin.strip() else text
+
+
 def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
                  connected_power, power_unit, project_label, utility,
                  module_choice, mounting_choice, inverter_choice, soiling_loss,
@@ -672,7 +705,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # Meta strip — 3 equally wide columns, safe
     col3 = W / 3
     meta_tbl = Table([[
-        Paragraph(f"<b>Location:</b> {location_name}", S_lbl),
+        Paragraph(f"<b>Location:</b> {safe_pdf_text(location_name)}", S_lbl),
         Paragraph(f"<b>Date:</b> {now}", S_lbl),
         Paragraph(f"<b>Utility:</b> {utility}", S_lbl),
     ]], colWidths=[col3, col3, col3])
@@ -705,7 +738,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     story.append(Paragraph(
         f"Based on NASA POWER climate data ({climate.get('psh','—')} kWh/m²/day GHI, "
         f"{climate.get('ws50','—')} m/s wind at 50m), {r['source']} is the optimal system for "
-        f"{location_name}. The {fmt(r['act_kwp'],1)} kWp system generates {fmt(r['ann_gen_mwh'],1)} MWh/yr, "
+        f"{safe_pdf_text(location_name)}. The {fmt(r['act_kwp'],1)} kWp system generates {fmt(r['ann_gen_mwh'],1)} MWh/yr, "
         f"covering {r['self_s']}% of the {fmt(r['daily_kwh'],1)} kWh/day demand at a performance ratio of "
         f"{r['pr']}%. At {int(r['tariff_aed']*100)} fils/kWh ({utility}), "
         f"the project achieves a {r['payback']}-year simple payback and {r['irr']}% IRR over {r['life']} years.",
@@ -835,7 +868,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
 
     clim_data = [
         ["Parameter",            "Value",                          "Parameter",          "Value"],
-        ["Location",             location_name,                    "Coordinates",        f"{lat:.4f}N, {lon:.4f}E"],
+        ["Location",             safe_pdf_text(location_name),                    "Coordinates",        f"{lat:.4f}N, {lon:.4f}E"],
         ["Daily GHI (PSH)",      f"{climate.get('psh','—')} kWh/m2/day", "Annual GHI", f"{climate.get('ghi_annual','—')} kWh/m2/yr"],
         ["Clear-sky GHI",        f"{climate.get('clear_sky','—')} kWh/m2/day","Clearness index (Kt)", str(climate.get('clearness','—'))],
         ["Wind speed @ 50m",     f"{climate.get('ws50','—')} m/s","Wind speed @ 10m",   f"{climate.get('ws10','—')} m/s"],
@@ -995,7 +1028,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     util_short = utility.split("(")[0].strip()
     steps = [
         f"Submit interconnection / net metering application to {util_short} — " + ("Shams Dubai portal (shams.dewa.gov.ae)" if "DEWA" in utility else "SEWA online portal (sewa.gov.ae)" if "SEWA" in utility else "FEWA customer portal" if "FEWA" in utility else "ADDC/AADC customer portal" if "ADDC" in utility else "local utility customer portal"),
-        f"Commission bankable P50/P90 energy yield assessment for {location_name} — required for project financing at {aed_s(r['total_cap'])} scale",
+        f"Commission bankable P50/P90 energy yield assessment for {safe_pdf_text(location_name)} — required for project financing at {aed_s(r['total_cap'])} scale",
         f"Appoint DEWA/Trakhees-approved EPC contractor and obtain No Objection Certificate (NOC) from relevant authority",
         f"Confirm site land availability: minimum {fmt(r['site_m2'],0)} m2 ({fmt(r['site_ha'],2)} ha) required for this system",
         f"Develop lender-ready financial model using P90 scenario — target DSCR of 1.20x or above (current model: {r['dscr']}x)" if r['dscr'] else "Develop lender-ready financial model using P90 generation scenario",
