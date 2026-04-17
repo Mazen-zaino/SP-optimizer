@@ -2,800 +2,1111 @@ import streamlit as st
 import requests
 import json
 import math
+import io
+from datetime import datetime
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="SP Optimizer",
-    page_icon="⚡",
-    layout="wide",
-)
+# reportlab imports
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm, mm
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                 TableStyle, HRFlowable, KeepTogether)
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+AED_PER_USD          = 3.6725
+UAE_EMISSION_FACTOR  = 0.341   # kg CO₂/kWh — DEWA 2023
+
+UAE_TARIFFS = {
+    "DEWA (Dubai)":            {"residential": 0.23, "commercial": 0.38, "industrial": 0.38},
+    "SEWA (Sharjah)":          {"residential": 0.21, "commercial": 0.34, "industrial": 0.34},
+    "FEWA (Northern Emirates)":{"residential": 0.22, "commercial": 0.36, "industrial": 0.36},
+    "ADDC / AADC (Abu Dhabi)": {"residential": 0.21, "commercial": 0.33, "industrial": 0.33},
+    "Custom / other":          {"residential": 0.25, "commercial": 0.38, "industrial": 0.38},
+}
+
+MODULE_SPECS = {
+    "Monocrystalline PERC 440Wp":   {"wp":440,"eff":0.210,"temp_coef":-0.0034,"cost_wp_aed":0.95,"bifacial":False},
+    "Monocrystalline TOPCon 580Wp": {"wp":580,"eff":0.223,"temp_coef":-0.0029,"cost_wp_aed":1.10,"bifacial":False},
+    "Bifacial TOPCon 600Wp":        {"wp":600,"eff":0.226,"temp_coef":-0.0029,"cost_wp_aed":1.20,"bifacial":True,"bifacial_gain":0.08},
+    "HJT (Heterojunction) 650Wp":   {"wp":650,"eff":0.242,"temp_coef":-0.0024,"cost_wp_aed":1.55,"bifacial":True,"bifacial_gain":0.10},
+    "CdTe Thin Film 150Wp":         {"wp":150,"eff":0.185,"temp_coef":-0.0032,"cost_wp_aed":0.80,"bifacial":False},
+}
+
+MOUNTING_TYPES = {
+    "Fixed tilt — ground mount":         {"gcr":0.40,"land_buffer":1.25,"capex_factor":1.00},
+    "Single-axis tracker (SAT)":         {"gcr":0.33,"land_buffer":1.30,"capex_factor":1.12},
+    "Dual-axis tracker (DAT)":           {"gcr":0.25,"land_buffer":1.35,"capex_factor":1.25},
+    "Ballasted rooftop — flat roof":     {"gcr":0.30,"land_buffer":1.15,"capex_factor":1.08},
+    "Flush-mounted — pitched roof":      {"gcr":0.85,"land_buffer":1.05,"capex_factor":1.05},
+    "Carport / solar canopy":            {"gcr":0.70,"land_buffer":1.10,"capex_factor":1.35},
+    "Agri-PV — elevated 3m clearance":  {"gcr":0.20,"land_buffer":1.40,"capex_factor":1.45},
+    "Floating PV (reservoir / pond)":    {"gcr":0.60,"land_buffer":1.20,"capex_factor":1.50},
+}
+
+INVERTER_TYPES = {
+    "String inverter (≤100 kW)":   {"eff":0.975,"cost_f":1.00},
+    "Central inverter (100 kW–5 MW)":{"eff":0.980,"cost_f":0.85},
+    "Large central (>5 MW)":        {"eff":0.982,"cost_f":0.75},
+    "Microinverter (residential)":  {"eff":0.960,"cost_f":1.40},
+}
+
+PROJECT_TYPES = {
+    "⚡ Utility-scale IPP":           {"ptype":"utility",    "op_h":24,"bess_h":0, "sector":"industrial"},
+    "🏭 Commercial & Industrial":     {"ptype":"ci",         "op_h":14,"bess_h":2, "sector":"commercial"},
+    "🏘️ Residential / Community":     {"ptype":"residential","op_h":6, "bess_h":4, "sector":"residential"},
+    "🏕️ Remote / Off-grid":           {"ptype":"offgrid",    "op_h":20,"bess_h":48,"sector":"commercial"},
+    "🏛️ Municipal / Public Sector":   {"ptype":"municipal",  "op_h":12,"bess_h":3, "sector":"commercial"},
+    "🌾 Agri-PV / Agrivoltaics":      {"ptype":"agri",       "op_h":14,"bess_h":2, "sector":"commercial"},
+    "🔥 Industrial Process Energy":   {"ptype":"industrial", "op_h":20,"bess_h":4, "sector":"industrial"},
+    "🚗 EV Charging / Mobility Hub":  {"ptype":"ev",         "op_h":16,"bess_h":4, "sector":"commercial"},
+    "🖥️ Data Center / Tech Campus":   {"ptype":"datacenter", "op_h":24,"bess_h":2, "sector":"industrial"},
+    "🏙️ Mixed-use Development":       {"ptype":"mixed",      "op_h":16,"bess_h":3, "sector":"commercial"},
+}
+
+TRACKER_BOOST = {
+    "Fixed tilt — ground mount":0.97, "Single-axis tracker (SAT)":1.17,
+    "Dual-axis tracker (DAT)":1.28,   "Ballasted rooftop — flat roof":0.96,
+    "Flush-mounted — pitched roof":0.95,"Carport / solar canopy":0.94,
+    "Agri-PV — elevated 3m clearance":0.91,"Floating PV (reservoir / pond)":1.03,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="SP Optimizer", page_icon="⚡", layout="wide")
 st.markdown("""
 <style>
-    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-    .section-header {
-        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.07em;
-        text-transform: uppercase; color: #888;
-        margin-top: 1.5rem; margin-bottom: 0.3rem;
-    }
-    .badge {
-        display: inline-block; padding: 5px 16px; border-radius: 20px;
-        font-size: 0.82rem; font-weight: 600; margin-bottom: 0.8rem;
-    }
-    .badge-solar  { background:#EAF3DE; color:#3B6D11; }
-    .badge-wind   { background:#E6F1FB; color:#185FA5; }
-    .badge-hybrid { background:#EEEDFE; color:#534AB7; }
-    table { width:100%; font-size:0.83rem; border-collapse:collapse; }
-    td { padding:7px 4px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
-    td:first-child { color:#666; width:58%; }
-    td:last-child  { font-weight:600; text-align:right; }
-    tr:last-child td { border-bottom:none; }
-    .bullet { font-size:0.84rem; color:#555; padding:3px 0; line-height:1.6; }
-    .source-note { font-size:0.71rem; color:#aaa; margin-top:0.3rem; font-style:italic; }
-    .info-box {
-        background:#f0f7ff; border-left:3px solid #378ADD;
-        border-radius:4px; padding:0.8rem 1rem; font-size:0.84rem;
-        color:#185FA5; margin-bottom:1rem;
-    }
+.block-container{padding-top:1.8rem;padding-bottom:2rem}
+.sh{font-size:.71rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+    color:#888;margin-top:1.4rem;margin-bottom:.35rem}
+.badge{display:inline-block;padding:5px 16px;border-radius:20px;
+       font-size:.85rem;font-weight:600;margin-bottom:.8rem}
+.badge-solar{background:#EAF3DE;color:#3B6D11}
+.badge-wind{background:#E6F1FB;color:#185FA5}
+.badge-hybrid{background:#EEEDFE;color:#534AB7}
+/* Big area card */
+.area-hero{background:linear-gradient(135deg,#0F6E56 0%,#1D9E75 100%);
+           border-radius:12px;padding:1.5rem 2rem;margin:1rem 0;color:white}
+.area-hero h2{color:white;font-size:1.1rem;font-weight:600;margin-bottom:1rem;
+              letter-spacing:.04em;text-transform:uppercase}
+.area-stat{background:rgba(255,255,255,0.15);border-radius:8px;
+           padding:.8rem 1rem;text-align:center}
+.area-stat .av{font-size:1.6rem;font-weight:700;color:white;line-height:1.1}
+.area-stat .al{font-size:.72rem;color:rgba(255,255,255,.8);
+               text-transform:uppercase;letter-spacing:.05em;margin-top:3px}
+.area-warn{background:#FFF3CD;border:1px solid #ffc107;border-radius:8px;
+           padding:.8rem 1rem;font-size:.84rem;color:#856404;margin-top:.8rem}
+table{width:100%;font-size:.82rem;border-collapse:collapse}
+td{padding:6px 4px;border-bottom:1px solid #f0f0f0;vertical-align:top}
+td:first-child{color:#666;width:58%}
+td:last-child{font-weight:600;text-align:right}
+tr:last-child td{border-bottom:none}
+.bullet{font-size:.84rem;color:#555;padding:3px 0;line-height:1.6}
+.src{font-size:.7rem;color:#aaa;font-style:italic;margin-top:.3rem}
+.info-banner{background:#fffbe6;border-left:3px solid #f5a623;
+             border-radius:4px;padding:.7rem 1rem;font-size:.83rem;
+             color:#7a5200;margin-bottom:1rem}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Project types ─────────────────────────────────────────────────────────────
-PROJECT_TYPES = {
-    "⚡ Utility-scale IPP":           "utility",
-    "🏭 Commercial & Industrial":     "ci",
-    "🏘️ Residential / Community":     "residential",
-    "🏕️ Remote / Off-grid":           "offgrid",
-    "🏛️ Municipal / Public Sector":   "municipal",
-    "🌾 Agri-PV / Agrivoltaics":      "agri",
-    "🔥 Industrial Process Energy":   "industrial",
-    "🚗 EV Charging / Mobility Hub":  "ev",
-    "🖥️ Data Center / Tech Campus":   "datacenter",
-    "🏙️ Mixed-use Development":       "mixed",
-}
-
-# ── Project type engineering parameters ──────────────────────────────────────
-TYPE_PARAMS = {
-    "utility":     {"op_hours": 24, "pv_wp": 580, "pv_eff": 0.223, "capex_wp": 0.55, "dc_ac": 1.28, "soiling": 0.95, "land_m2_kwp": 6.5,  "bess_hours": 0,   "label": "Utility-scale IPP"},
-    "ci":          {"op_hours": 14, "pv_wp": 545, "pv_eff": 0.210, "capex_wp": 0.78, "dc_ac": 1.20, "soiling": 0.97, "land_m2_kwp": 7.0,  "bess_hours": 2,   "label": "Commercial & Industrial"},
-    "residential": {"op_hours": 6,  "pv_wp": 415, "pv_eff": 0.200, "capex_wp": 1.05, "dc_ac": 1.10, "soiling": 0.98, "land_m2_kwp": 8.0,  "bess_hours": 4,   "label": "Residential / Community"},
-    "offgrid":     {"op_hours": 20, "pv_wp": 545, "pv_eff": 0.210, "capex_wp": 1.10, "dc_ac": 1.15, "soiling": 0.95, "land_m2_kwp": 7.5,  "bess_hours": 48,  "label": "Remote / Off-grid"},
-    "municipal":   {"op_hours": 12, "pv_wp": 545, "pv_eff": 0.210, "capex_wp": 0.85, "dc_ac": 1.18, "soiling": 0.97, "land_m2_kwp": 7.0,  "bess_hours": 3,   "label": "Municipal / Public Sector"},
-    "agri":        {"op_hours": 14, "pv_wp": 545, "pv_eff": 0.210, "capex_wp": 0.82, "dc_ac": 1.15, "soiling": 0.96, "land_m2_kwp": 18.0, "bess_hours": 2,   "label": "Agri-PV / Agrivoltaics"},
-    "industrial":  {"op_hours": 20, "pv_wp": 580, "pv_eff": 0.223, "capex_wp": 0.70, "dc_ac": 1.25, "soiling": 0.95, "land_m2_kwp": 6.5,  "bess_hours": 4,   "label": "Industrial Process Energy"},
-    "ev":          {"op_hours": 16, "pv_wp": 430, "pv_eff": 0.205, "capex_wp": 0.95, "dc_ac": 1.10, "soiling": 0.97, "land_m2_kwp": 9.0,  "bess_hours": 4,   "label": "EV Charging / Mobility Hub"},
-    "datacenter":  {"op_hours": 24, "pv_wp": 580, "pv_eff": 0.223, "capex_wp": 0.65, "dc_ac": 1.25, "soiling": 0.97, "land_m2_kwp": 7.0,  "bess_hours": 2,   "label": "Data Center / Tech Campus"},
-    "mixed":       {"op_hours": 16, "pv_wp": 545, "pv_eff": 0.210, "capex_wp": 0.80, "dc_ac": 1.20, "soiling": 0.97, "land_m2_kwp": 7.5,  "bess_hours": 3,   "label": "Mixed-use Development"},
-}
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚡ SP Optimizer")
     st.markdown("---")
-    st.success("✅ No API key required")
+    st.success("✅ No API key required — 100% free")
     st.markdown("""
-This app runs entirely on:
-- **NASA POWER API** (free)
-- **OpenStreetMap** (free)
-- **Built-in engineering formulas**
+**Data sources:**
+- 🛰️ NASA POWER API (22-yr avg)
+- 🌍 PVGIS EU JRC (yield check)
+- 🗺️ OpenStreetMap (geocoding)
+- 🇦🇪 DEWA/SEWA/FEWA tariffs 2024
 
-No account needed. No cost. Unlimited use.
+**Report formats:** PDF download
 
----
-**Auto-fetched from NASA POWER:**
-- Global Horizontal Irradiance (GHI)
-- Peak sun hours (PSH)
-- Wind speed at 50m
-- Temperature & humidity
-- Precipitation
+**Currency:** AED (1 USD = 3.6725 AED)
+""")
 
-22-year climatological average.
-    """)
+# ─────────────────────────────────────────────────────────────────────────────
+# TITLE
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("⚡ SP Optimizer — UAE Edition")
+st.markdown('<div class="info-banner">🇦🇪 AED pricing · UAE utility tariffs · NASA POWER + PVGIS climate data · PDF report download · No API key needed</div>', unsafe_allow_html=True)
 
-# ── Title ─────────────────────────────────────────────────────────────────────
-st.title("SP Optimizer")
-st.markdown('<div class="info-box">⚡ Fully free — no API key required. Enter your connected load and location, and the app calculates everything using NASA climate data and built-in engineering models.</div>', unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<p class="sh">Step 1 — Project location & load</p>', unsafe_allow_html=True)
+c1,c2,c3 = st.columns([3,1.5,1])
+coord_input     = c1.text_input("📍 Location", placeholder="Dubai, UAE  or  25.2048, 55.2708")
+connected_power = c2.number_input("⚡ Connected load", min_value=0.0, value=None, placeholder="e.g. 500", format="%.2f")
+power_unit      = c3.selectbox("Unit", ["kW","MW","GW"])
 
-# ── Core inputs ───────────────────────────────────────────────────────────────
-st.markdown('<p class="section-header">Core inputs</p>', unsafe_allow_html=True)
-c1, c2, c3 = st.columns([3, 1.5, 1])
-coord_input     = c1.text_input("📍 Project location", placeholder="Coordinates: 25.2048, 55.2708   or   City: Dubai, UAE")
-connected_power = c2.number_input("⚡ Total connected power", min_value=0.0, value=None, placeholder="e.g. 50", format="%.2f")
-power_unit      = c3.selectbox("Unit", ["kW", "MW", "GW"])
+st.markdown('<p class="sh">Step 2 — Project type & utility</p>', unsafe_allow_html=True)
+c1,c2 = st.columns(2)
+project_label = c1.selectbox("Project type", list(PROJECT_TYPES.keys()))
+utility       = c2.selectbox("UAE utility provider", list(UAE_TARIFFS.keys()))
 
-st.markdown('<p class="section-header">Project type</p>', unsafe_allow_html=True)
-project_label = st.selectbox("Project type", list(PROJECT_TYPES.keys()), label_visibility="collapsed")
+st.markdown('<p class="sh">Step 3 — System design</p>', unsafe_allow_html=True)
+c1,c2,c3 = st.columns(3)
+module_choice   = c1.selectbox("PV module", list(MODULE_SPECS.keys()), index=1)
+mounting_choice = c2.selectbox("Mounting system", list(MOUNTING_TYPES.keys()))
+inverter_choice = c3.selectbox("Inverter type", list(INVERTER_TYPES.keys()), index=1)
 
-with st.expander("💰 Financial parameters (optional)"):
-    f1, f2, f3, f4 = st.columns(4)
-    tariff   = f1.number_input("Grid tariff / PPA (¢/kWh)", min_value=0.0, value=None, placeholder="e.g. 8", format="%.2f", help="Local electricity price or PPA rate. Left blank = auto-estimated from location.")
-    wacc     = f2.number_input("WACC / discount rate (%)", min_value=0.0, max_value=30.0, value=None, placeholder="e.g. 7", format="%.1f")
-    lifetime = f3.number_input("Project lifetime (years)", min_value=1, max_value=50, value=None, placeholder="e.g. 25", format="%d")
-    degradation = f4.number_input("Panel degradation (%/yr)", min_value=0.0, max_value=5.0, value=None, placeholder="e.g. 0.5", format="%.2f")
+c1,c2,c3,c4 = st.columns(4)
+oversizing    = c1.slider("Oversizing factor", 1.00, 1.50, 1.15, 0.05)
+tilt_angle    = c2.number_input("Fixed tilt (°)", min_value=0, max_value=45, value=25)
+soiling_loss  = c3.slider("Soiling loss (%)", 1.0, 15.0, 4.0, 0.5)
+ground_albedo = c4.slider("Ground albedo (%)", 5, 40, 20)
 
-with st.expander("⚙️ System preferences (optional)"):
-    grid_type   = st.radio("Grid connection", ["Grid-connected", "Hybrid + BESS", "Off-grid"], horizontal=True)
-    oversizing  = st.slider("System oversizing factor", 1.0, 1.5, 1.15, 0.05, help="Factor applied above minimum required capacity to account for losses and future demand. 1.15 = 15% oversize.")
+st.markdown('<p class="sh">Step 4 — Site area</p>', unsafe_allow_html=True)
+c1,c2,c3 = st.columns(3)
+available_area = c1.number_input("Available area (m²) — leave 0 if unknown",
+    min_value=0.0, value=0.0, format="%.0f",
+    help="If you enter an area, the app checks if it fits the system. Leave 0 to just calculate required area.")
+setback_pct    = c2.slider("Setback / unusable area (%)", 0, 40, 15,
+    help="Roads, fencing, inverter pads, fire clearances — typically 10–20%.")
+azimuth        = c3.selectbox("Panel orientation",
+    ["South (optimal)","South-East","South-West","East-West (split)"])
+
+st.markdown('<p class="sh">Step 5 — Financial parameters</p>', unsafe_allow_html=True)
+ptype_cfg  = PROJECT_TYPES[project_label]
+sector     = ptype_cfg["sector"]
+default_t  = UAE_TARIFFS[utility][sector]
+
+c1,c2,c3,c4 = st.columns(4)
+custom_tariff = c1.number_input("Tariff (fils/kWh)",
+    min_value=0.0, value=float(int(default_t*100)), format="%.0f",
+    help=f"Auto-filled from {utility} {sector} rate. 100 fils = 1 AED.")
+wacc         = c2.number_input("WACC (%)", min_value=0.0, max_value=30.0, value=7.0, format="%.1f")
+lifetime     = c3.number_input("Project lifetime (years)", min_value=5, max_value=40, value=25, format="%d")
+degradation  = c4.number_input("Panel degradation (%/yr)", min_value=0.0, max_value=2.0, value=0.50, format="%.2f")
+
+c1,c2,c3,c4 = st.columns(4)
+opex_pct    = c1.slider("O&M (% CAPEX/yr)", 0.5, 3.0, 1.0, 0.1)
+debt_ratio  = c2.slider("Debt ratio (%)", 0, 80, 60)
+debt_rate   = c3.number_input("Debt interest rate (%)", min_value=0.0, max_value=15.0, value=5.5, format="%.1f")
+carbon_price= c4.number_input("Carbon price (AED/tonne)", min_value=0.0, value=55.0, format="%.1f")
+
+with st.expander("🔋 BESS options"):
+    b1,b2,b3 = st.columns(3)
+    bess_override = b1.selectbox("BESS", ["Auto","Force include","No BESS"])
+    bess_chem     = b2.selectbox("Chemistry", ["LFP (recommended)","NMC","Lead-Acid"])
+    bess_h_custom = b3.number_input("Override hours (0=auto)", min_value=0.0, value=0.0, format="%.0f")
+
+with st.expander("🌬️ Wind & other options"):
+    w1,w2,w3 = st.columns(3)
+    include_wind  = w1.checkbox("Include wind assessment", value=True)
+    net_metering  = w2.checkbox("Net metering available", value=True)
+    grid_type     = w3.radio("Grid connection", ["Grid-connected","Hybrid + BESS","Off-grid"], horizontal=True)
 
 st.markdown("")
-go = st.button("⚡ Calculate system design", use_container_width=True, type="primary")
+go = st.button("⚡ Calculate system design & generate report", use_container_width=True, type="primary")
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ═════════════════════════════════════════════════════════════════════════════
-
-def parse_coordinates(text):
-    parts = text.strip().replace(";", ",").split(",")
-    if len(parts) == 2:
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_coords(text):
+    parts = text.strip().replace(";",",").split(",")
+    if len(parts)==2:
         try:
-            lat, lon = float(parts[0].strip()), float(parts[1].strip())
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return lat, lon
-        except ValueError:
-            pass
+            la,lo = float(parts[0].strip()), float(parts[1].strip())
+            if -90<=la<=90 and -180<=lo<=180: return la,lo
+        except: pass
     return None
 
-def geocode_city(name):
+def geocode(name):
     try:
         r = requests.get("https://nominatim.openstreetmap.org/search",
-            params={"q": name, "format": "json", "limit": 1},
-            headers={"User-Agent": "SPOptimizer/1.0"}, timeout=10)
+            params={"q":name,"format":"json","limit":1},
+            headers={"User-Agent":"SPOptimizer/2.0"}, timeout=10)
         d = r.json()
-        if d:
-            return float(d[0]["lat"]), float(d[0]["lon"])
-    except Exception:
-        pass
+        if d: return float(d[0]["lat"]), float(d[0]["lon"])
+    except: pass
     return None
 
-def reverse_geocode(lat, lon):
+def rev_geocode(lat,lon):
     try:
         r = requests.get("https://nominatim.openstreetmap.org/reverse",
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers={"User-Agent": "SPOptimizer/1.0"}, timeout=10)
-        addr = r.json().get("address", {})
-        parts = [addr[k] for k in ["city","town","village","state","country"] if addr.get(k)]
-        return ", ".join(parts[:2]) if parts else f"{lat:.3f}, {lon:.3f}"
-    except Exception:
-        return f"{lat:.4f}, {lon:.4f}"
+            params={"lat":lat,"lon":lon,"format":"json"},
+            headers={"User-Agent":"SPOptimizer/2.0"}, timeout=10)
+        addr = r.json().get("address",{})
+        parts=[addr[k] for k in ["suburb","city","town","state","country"] if addr.get(k)]
+        return ", ".join(parts[:3]) if parts else f"{lat:.3f},{lon:.3f}"
+    except: return f"{lat:.4f},{lon:.4f}"
 
-def fetch_nasa_power(lat, lon):
-    params_list = "ALLSKY_SFC_SW_DWN,CLRSKY_SFC_SW_DWN,WS50M,WS10M,T2M,PRECTOTCORR,RH2M"
-    url = (f"https://power.larc.nasa.gov/api/temporal/climatology/point"
-           f"?parameters={params_list}&community=RE&longitude={lon}&latitude={lat}&format=JSON")
+def fetch_nasa(lat,lon):
+    params="ALLSKY_SFC_SW_DWN,CLRSKY_SFC_SW_DWN,WS50M,WS80M,WS10M,T2M,T2M_MAX,T2M_MIN,PRECTOTCORR,RH2M,ALLSKY_KT"
+    url=(f"https://power.larc.nasa.gov/api/temporal/climatology/point"
+         f"?parameters={params}&community=RE&longitude={lon}&latitude={lat}&format=JSON")
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        props = r.json()["properties"]["parameter"]
-        ghi_d  = props.get("ALLSKY_SFC_SW_DWN", {}).get("ANN")
-        clr    = props.get("CLRSKY_SFC_SW_DWN", {}).get("ANN")
-        ws50   = props.get("WS50M",  {}).get("ANN")
-        ws10   = props.get("WS10M",  {}).get("ANN")
-        temp   = props.get("T2M",    {}).get("ANN")
-        precip = props.get("PRECTOTCORR", {}).get("ANN")
-        humid  = props.get("RH2M",   {}).get("ANN")
-        monthly_ghi = {k: v for k, v in props.get("ALLSKY_SFC_SW_DWN", {}).items() if k != "ANN"}
-        return {
-            "ghi_daily":    round(ghi_d, 3) if ghi_d else None,
-            "ghi_annual":   int(ghi_d * 365) if ghi_d else None,
-            "psh":          round(ghi_d, 3) if ghi_d else None,
-            "clear_sky":    round(clr, 2) if clr else None,
-            "wind_50m":     round(ws50, 2) if ws50 else None,
-            "wind_10m":     round(ws10, 2) if ws10 else None,
-            "temp":         round(temp, 1) if temp else None,
-            "precip":       round(precip, 2) if precip else None,
-            "humidity":     round(humid, 1) if humid else None,
-            "monthly_ghi":  monthly_ghi,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        r=requests.get(url,timeout=35); r.raise_for_status()
+        p=r.json()["properties"]["parameter"]
+        def g(k): return p.get(k,{}).get("ANN")
+        ghi_d=g("ALLSKY_SFC_SW_DWN"); kt=g("ALLSKY_KT")
+        return {"ghi_daily":round(ghi_d,3) if ghi_d else None,
+                "ghi_annual":int(ghi_d*365) if ghi_d else None,
+                "psh":round(ghi_d,3) if ghi_d else None,
+                "clear_sky":round(g("CLRSKY_SFC_SW_DWN"),2) if g("CLRSKY_SFC_SW_DWN") else None,
+                "clearness":round(kt,3) if kt else None,
+                "ws50":round(g("WS50M"),2) if g("WS50M") else None,
+                "ws80":round(g("WS80M"),2) if g("WS80M") else None,
+                "temp":round(g("T2M"),1) if g("T2M") else None,
+                "temp_max":round(g("T2M_MAX"),1) if g("T2M_MAX") else None,
+                "temp_min":round(g("T2M_MIN"),1) if g("T2M_MIN") else None,
+                "humidity":round(g("RH2M"),1) if g("RH2M") else None,
+                "source":"NASA POWER Climatology API (2001–2022)"}
+    except Exception as e: return {"error":str(e)}
 
-def to_kw(value, unit):
-    return value * {"kW": 1, "MW": 1_000, "GW": 1_000_000}[unit]
+def fetch_pvgis(lat,lon,tilt,az_deg,kwp):
+    try:
+        r=requests.get("https://re.jrc.ec.europa.eu/api/v5_2/PVcalc",
+            params={"lat":lat,"lon":lon,"peakpower":kwp,"loss":14,
+                    "angle":tilt,"aspect":az_deg,"outputformat":"json","pvtechchoice":"crystSi"},
+            timeout=20)
+        if r.status_code==200:
+            t=r.json().get("outputs",{}).get("totals",{}).get("fixed",{})
+            return {"yield_kwh_yr":round(t["E_y"],0) if t.get("E_y") else None,
+                    "irr_kwh_m2_yr":round(t["H(i)_y"],0) if t.get("H(i)_y") else None,
+                    "loss_pct":round(t["l_total"],1) if t.get("l_total") else None,
+                    "source":"PVGIS 5.2 — EU Joint Research Centre (JRC)"}
+    except: pass
+    return None
 
-def estimate_grid_emission_factor(lat, lon):
-    """Rough CO2 emission factor (kg/kWh) based on coordinates."""
-    # GCC / Middle East
-    if 12 <= lat <= 32 and 32 <= lon <= 65:
-        return 0.55
-    # Europe
-    if 35 <= lat <= 72 and -12 <= lon <= 45:
-        return 0.25
-    # North America
-    if 24 <= lat <= 72 and -140 <= lon <= -52:
-        return 0.38
-    # East Asia
-    if 10 <= lat <= 55 and 100 <= lon <= 145:
-        return 0.55
-    # South Asia
-    if 5 <= lat <= 37 and 65 <= lon <= 100:
-        return 0.70
-    # Africa
-    if -35 <= lat <= 37 and -20 <= lon <= 55:
-        return 0.50
-    return 0.45  # global average default
+def az_deg(label): return {"South (optimal)":0,"South-East":-45,"South-West":45,"East-West (split)":0}.get(label,0)
+def to_kw(v,u): return v*{"kW":1,"MW":1e3,"GW":1e6}[u]
+def fmt(n,d=0): 
+    if n is None or (isinstance(n,float) and math.isnan(n)): return "—"
+    return f"{int(round(n)):,}" if d==0 else f"{round(n,d):,.{d}f}"
+def aed_s(n,d=0):
+    if n is None: return "—"
+    if abs(n)>=1e6: return f"AED {round(n/1e6,2):,.2f}M"
+    if abs(n)>=1e3: return f"AED {round(n/1e3,1):,.1f}K"
+    return f"AED {round(n,d):,.{d}f}"
+def irr_b(cfs):
+    def npv(r): return sum(cf/(1+r)**i for i,cf in enumerate(cfs))
+    lo,hi=-0.99,5.0
+    if npv(lo)*npv(hi)>0: return None
+    for _ in range(300):
+        mid=(lo+hi)/2
+        if npv(mid)>0: lo=mid
+        else: hi=mid
+        if hi-lo<1e-7: break
+    return (lo+hi)/2*100
+def npv_c(cfs,cap,w):
+    r=w/100
+    return sum(cf/(1+r)**(i+1) for i,cf in enumerate(cfs))-cap
 
-def estimate_tariff(lat, lon):
-    """Estimate local grid tariff (USD/kWh) based on region."""
-    if 12 <= lat <= 32 and 32 <= lon <= 65:
-        return 0.08   # GCC
-    if 35 <= lat <= 72 and -12 <= lon <= 45:
-        return 0.22   # Europe
-    if 24 <= lat <= 72 and -140 <= lon <= -52:
-        return 0.12   # North America
-    if 10 <= lat <= 55 and 100 <= lon <= 145:
-        return 0.10   # East Asia
-    if 5 <= lat <= 37 and 65 <= lon <= 100:
-        return 0.09   # South Asia
-    return 0.11
+# ─────────────────────────────────────────────────────────────────────────────
+# CALCULATOR
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
+              module_choice, mounting_choice, inverter_choice,
+              grid_type, oversizing, tilt, az_label, soiling_pct, albedo_pct,
+              tariff_aed, wacc, life, degr, opex_pct, debt_ratio, debt_rate,
+              bess_override, bess_chem, bess_h_custom, include_wind,
+              carbon_price_aed, net_metering, avail_m2, setback_pct, lat, lon):
 
-def npv_calc(annual_cashflows, wacc_pct):
-    r = wacc_pct / 100
-    return sum(cf / (1 + r) ** (i + 1) for i, cf in enumerate(annual_cashflows))
+    mod = MODULE_SPECS[module_choice]
+    mnt = MOUNTING_TYPES[mounting_choice]
+    inv_eff = INVERTER_TYPES[inverter_choice]["eff"]
+    inv_cf  = INVERTER_TYPES[inverter_choice]["cost_f"]
+    op_h    = ptype_cfg["op_h"]
 
-def irr_calc(cashflows):
-    """Simple IRR via bisection method."""
-    def npv_at_rate(r):
-        return sum(cf / (1 + r) ** i for i, cf in enumerate(cashflows))
-    lo, hi = -0.99, 10.0
-    for _ in range(200):
-        mid = (lo + hi) / 2
-        if npv_at_rate(mid) > 0:
-            lo = mid
+    psh   = climate.get("psh", 5.5)
+    temp  = climate.get("temp", 28.0)
+    tmax  = climate.get("temp_max", 42.0)
+    ws50  = climate.get("ws50", 4.5)
+
+    # Temperature
+    cell_temp   = temp + 25
+    temp_dera   = 1 + mod["temp_coef"] * (cell_temp - 25)
+    temp_dera   = max(0.75, min(1.02, temp_dera))
+
+    # Bifacial
+    bifacial_g  = mod.get("bifacial_gain",0)*( albedo_pct/20) if mod.get("bifacial") else 0
+
+    # Azimuth derate
+    az_d = {"South (optimal)":1.00,"South-East":0.95,"South-West":0.95,"East-West (split)":0.89}.get(az_label,1.0)
+
+    # PR
+    pr = (temp_dera * (1-soiling_pct/100) * inv_eff * 0.980 * 0.980 *
+          az_d * TRACKER_BOOST.get(mounting_choice,1.0) * (1+bifacial_g))
+    pr = round(max(0.60,min(1.05,pr)), 3)
+
+    # Source
+    sol_score = psh/6.0; wnd_score = ws50/8.0
+    if include_wind and wnd_score>=0.75 and sol_score>=0.70:
+        source="Solar PV + Wind Hybrid"; badge="hybrid"; sf=0.70; wf=0.30
+    elif include_wind and wnd_score>sol_score*1.2 and wnd_score>=0.75:
+        source="Onshore Wind"; badge="wind"; sf=0.0; wf=1.0
+    else:
+        source="Solar PV"; badge="solar"; sf=1.0; wf=0.0
+
+    # Sizing
+    daily_kwh = connected_kw * op_h
+    ann_dem   = daily_kwh * 365
+    min_kwp   = (daily_kwh/(psh*pr)) if psh>0 else connected_kw*1.5
+    sys_kwp   = min_kwp * oversizing * sf
+    wind_kw   = min_kwp * oversizing * wf if wf>0 else 0
+
+    # Panels & area
+    num_pan   = math.ceil((sys_kwp*1000)/mod["wp"]) if sys_kwp>0 else 0
+    act_kwp   = (num_pan*mod["wp"])/1000
+    m2_per_panel = mod["wp"]/1000/mod["eff"]      # m² per panel
+    panel_m2  = num_pan * m2_per_panel             # pure panel area
+    gcr       = mnt["gcr"]
+    array_m2  = panel_m2/gcr if gcr>0 else panel_m2  # array footprint
+    usable_f  = (1-setback_pct/100)/mnt["land_buffer"]
+    site_m2   = array_m2/usable_f if usable_f>0 else array_m2*mnt["land_buffer"]*(1+setback_pct/100)
+    site_ha   = site_m2/10000
+    site_m2_kwp = site_m2/act_kwp if act_kwp>0 else 0
+    arr_m2_kwp  = array_m2/act_kwp if act_kwp>0 else 0
+
+    # Available area check
+    area_ok = True; max_kwp_area = None
+    if avail_m2 and avail_m2>0:
+        usable_avail = avail_m2*(1-setback_pct/100)/mnt["land_buffer"]
+        max_kwp_area = usable_avail*gcr*mod["eff"]*1000
+        if max_kwp_area < act_kwp*0.95: area_ok=False
+
+    # Generation
+    ann_solar = act_kwp*psh*365*pr
+    pvgis_used=False
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        ann_solar=pvgis_data["yield_kwh_yr"]; pvgis_used=True
+    wind_cf=0; ann_wind=0
+    if wind_kw>0:
+        wind_cf = min(0.42,max(0.12,(ws50/13)**3*0.42))
+        ann_wind = wind_kw*wind_cf*8760
+    ann_gen  = ann_solar+ann_wind
+    spec_yld = ann_solar/act_kwp if act_kwp>0 else 0
+    cap_f    = ann_gen/((act_kwp+wind_kw)*8760)*100 if (act_kwp+wind_kw)>0 else 0
+    self_s   = min(100.0, ann_gen/ann_dem*100) if ann_dem>0 else 100.0
+
+    # BESS
+    def_bh = ptype_cfg["bess_h"]
+    if bess_override=="No BESS": bh=0
+    elif bess_override=="Force include": bh=bess_h_custom if bess_h_custom>0 else max(def_bh,2)
+    else:
+        bh = max(def_bh,48) if grid_type=="Off-grid" else (max(def_bh,4) if grid_type=="Hybrid + BESS" else def_bh)
+    bess_kwh=bess_kw=bess_cap_aed=0
+    if bh>0:
+        bess_kwh=connected_kw*bh; bess_kw=connected_kw
+        cst={"LFP (recommended)":1200,"NMC":1100,"Lead-Acid":600}.get(bess_chem,1200)
+        bess_cap_aed=bess_kwh*cst
+
+    # CAPEX (AED)
+    cap_mod = act_kwp*1000*mod["cost_wp_aed"]*mnt["capex_factor"]
+    cap_inv = act_kwp*1000*0.18*inv_cf*AED_PER_USD
+    cap_mnt = act_kwp*1000*0.22*AED_PER_USD*mnt["capex_factor"]
+    cap_bos = act_kwp*1000*0.16*AED_PER_USD
+    cap_epc = (cap_mod+cap_inv+cap_mnt+cap_bos)*0.10
+    cap_con = (cap_mod+cap_inv+cap_mnt+cap_bos+cap_epc)*0.05
+    cap_wnd = wind_kw*1000*4.0*AED_PER_USD
+    total_cap= cap_mod+cap_inv+cap_mnt+cap_bos+cap_epc+cap_con+cap_wnd+bess_cap_aed
+    cap_wp   = total_cap/(act_kwp*1000) if act_kwp>0 else 0
+    def pct(x): return round(x/total_cap*100,1) if total_cap>0 else 0
+    cb={"Modules":pct(cap_mod),"Inverters":pct(cap_inv),"Mounting & civil":pct(cap_mnt),
+        "BOS & electrical":pct(cap_bos),"EPC / design":pct(cap_epc),
+        "Contingency":pct(cap_con),"BESS":pct(bess_cap_aed),"Wind turbines":pct(cap_wnd)}
+
+    # Financials
+    degr_r   = degr/100
+    ann_opex = total_cap*(opex_pct/100)
+    cfs=[-total_cap]
+    for yr in range(1,int(life)+1):
+        g_yr=ann_gen*((1-degr_r)**(yr-1))
+        cfs.append(g_yr*tariff_aed - ann_opex*(1.025**(yr-1)))
+    npv_v = npv_c(cfs[1:],total_cap,wacc)
+    irr_v = irr_b(cfs)
+    pay   = total_cap/cfs[1] if cfs[1]>0 else 99
+    tgl   = sum(ann_gen*((1-degr_r)**yr) for yr in range(int(life)))
+    pv_c  = total_cap+npv_c([ann_opex*(1.025**yr) for yr in range(int(life))],0,wacc)
+    lcoe  = pv_c/tgl*1000 if tgl>0 else 0
+    y1rev = cfs[1]+ann_opex
+    eq    = total_cap*(1-debt_ratio/100); dbt=total_cap*(debt_ratio/100)
+    r_d=debt_rate/100/12; n_m=int(life)*12
+    ann_ds = dbt*(r_d*(1+r_d)**n_m)/((1+r_d)**n_m-1)*12 if dbt>0 and debt_rate>0 else 0
+    dscr  = cfs[1]/ann_ds if ann_ds>0 else None
+    eq_cfs=[-eq]+[cf-ann_ds for cf in cfs[1:]]
+    eq_irr= irr_b(eq_cfs)
+    co2_yr = ann_gen*UAE_EMISSION_FACTOR/1000
+    co2_lf = co2_yr*life
+    co2_rev= co2_yr*carbon_price_aed
+    hh     = int(ann_gen/12000)
+
+    # Wind specs
+    if wind_kw>0:
+        t_kw=3000 if wind_kw>10000 else 1500 if wind_kw>2000 else 500
+        n_t=max(1,math.ceil(wind_kw/t_kw))
+        h_hub=120 if t_kw>=3000 else 100 if t_kw>=1500 else 65
+        r_dt=136 if t_kw>=3000 else 90 if t_kw>=1500 else 54
+    else: t_kw=n_t=h_hub=r_dt=0
+
+    return dict(
+        source=source,badge=badge,pvgis_used=pvgis_used,
+        act_kwp=round(act_kwp,1),wind_kw=round(wind_kw,1),
+        num_pan=num_pan,panel_m2=round(panel_m2,1),
+        gcr=gcr,array_m2=round(array_m2,1),
+        site_m2=round(site_m2,1),site_ha=round(site_ha,3),
+        site_m2_kwp=round(site_m2_kwp,1),arr_m2_kwp=round(arr_m2_kwp,1),
+        area_ok=area_ok,max_kwp_area=max_kwp_area,
+        pr=round(pr*100,1),cell_temp=round(cell_temp,1),
+        temp_dera=round((1-temp_dera)*100,2),bifacial_g=round(bifacial_g*100,1),
+        ann_gen=round(ann_gen,0),ann_gen_mwh=round(ann_gen/1000,1),
+        ann_dem=round(ann_dem,0),self_s=round(self_s,1),
+        cap_f=round(cap_f,1),spec_yld=round(spec_yld,0),
+        daily_kwh=round(daily_kwh,1),op_h=op_h,
+        bess_kwh=round(bess_kwh,1),bess_kw=round(bess_kw,1),
+        bess_h=round(bess_kwh/bess_kw,1) if bess_kw>0 else 0,
+        bess_cap_aed=round(bess_cap_aed,0),
+        total_cap=round(total_cap,0),cap_wp=round(cap_wp,2),
+        ann_opex=round(ann_opex,0),lcoe=round(lcoe,1),
+        tariff_aed=tariff_aed,y1rev=round(y1rev,0),
+        y1net=round(cfs[1],0),npv=round(npv_v,0),
+        irr=round(irr_v,1) if irr_v else None,
+        eq_irr=round(eq_irr,1) if eq_irr else None,
+        payback=round(pay,1),wacc=wacc,life=int(life),
+        dscr=round(dscr,2) if dscr else None,
+        eq_aed=round(eq,0),dbt_aed=round(dbt,0),ann_ds=round(ann_ds,0),
+        debt_ratio=debt_ratio,debt_rate=debt_rate,cb=cb,
+        co2_yr=round(co2_yr,1),co2_lf=round(co2_lf,0),
+        co2_rev=round(co2_rev,0),hh=hh,
+        t_kw=t_kw,n_t=n_t,h_hub=h_hub,r_dt=r_dt,
+        wind_cf=round(wind_cf*100,1),
+        degr=degr,net_metering=net_metering,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
+                 connected_power, power_unit, project_label, utility,
+                 module_choice, mounting_choice, inverter_choice, soiling_loss,
+                 tilt_angle, azimuth, ground_albedo, setback_pct, avail_m2,
+                 custom_tariff, wacc, lifetime, degradation, opex_pct,
+                 debt_ratio, debt_rate, carbon_price, bess_chem, net_metering):
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2.2*cm, bottomMargin=2*cm)
+
+    W = A4[0] - 4*cm   # usable width
+
+    # Colours
+    GREEN_DARK  = colors.HexColor("#0F6E56")
+    GREEN_MID   = colors.HexColor("#1D9E75")
+    GREEN_LIGHT = colors.HexColor("#E1F5EE")
+    AMBER       = colors.HexColor("#F5A623")
+    GRAY_LIGHT  = colors.HexColor("#F8F9FA")
+    GRAY_MED    = colors.HexColor("#DEE2E6")
+    BLACK       = colors.HexColor("#212529")
+    WHITE       = colors.white
+
+    # Styles
+    styles = getSampleStyleSheet()
+    def sty(name,**kw):
+        s=ParagraphStyle(name,parent=styles["Normal"],**kw)
+        return s
+    S_title   = sty("T",fontSize=18,fontName="Helvetica-Bold",textColor=WHITE,leading=22)
+    S_sub     = sty("SB",fontSize=10,fontName="Helvetica",textColor=WHITE,leading=14)
+    S_h2      = sty("H2",fontSize=12,fontName="Helvetica-Bold",textColor=GREEN_DARK,spaceAfter=4)
+    S_h3      = sty("H3",fontSize=10,fontName="Helvetica-Bold",textColor=BLACK,spaceAfter=2)
+    S_body    = sty("BD",fontSize=9,fontName="Helvetica",textColor=BLACK,leading=13)
+    S_small   = sty("SM",fontSize=8,fontName="Helvetica",textColor=colors.HexColor("#666666"))
+    S_val     = sty("VL",fontSize=9,fontName="Helvetica-Bold",textColor=BLACK,alignment=TA_RIGHT)
+    S_label   = sty("LB",fontSize=8,fontName="Helvetica",textColor=colors.HexColor("#555555"))
+    S_center  = sty("CT",fontSize=9,fontName="Helvetica",alignment=TA_CENTER)
+    S_note    = sty("NT",fontSize=7.5,fontName="Helvetica-Oblique",
+                    textColor=colors.HexColor("#888888"),leading=11)
+
+    def table_style(header=True):
+        ts=[
+            ("BACKGROUND",(0,0),(-1,0),GREEN_DARK) if header else ("BACKGROUND",(0,0),(-1,0),GRAY_LIGHT),
+            ("TEXTCOLOR",(0,0),(-1,0),WHITE if header else BLACK),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("FONTSIZE",(0,0),(-1,0),8.5 if header else 8),
+            ("FONTNAME",(0,1),(-1,-1),"Helvetica"),
+            ("FONTSIZE",(0,1),(-1,-1),8.5),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
+            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+            ("TOPPADDING",(0,0),(-1,-1),4),
+            ("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),6),
+            ("RIGHTPADDING",(0,0),(-1,-1),6),
+        ]
+        return TableStyle(ts)
+
+    def kv_table(rows, col_w=None):
+        cw = col_w or [W*0.55, W*0.45]
+        data=[[Paragraph(str(k),S_label),Paragraph(str(v),S_val)] for k,v in rows]
+        t=Table(data,colWidths=cw)
+        t.setStyle(TableStyle([
+            ("FONTNAME",(0,0),(-1,-1),"Helvetica"),
+            ("FONTSIZE",(0,0),(-1,-1),8.5),
+            ("FONTNAME",(1,0),(1,-1),"Helvetica-Bold"),
+            ("ROWBACKGROUNDS",(0,0),(-1,-1),[WHITE,GRAY_LIGHT]),
+            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+        ]))
+        return t
+
+    def section(title): return [
+        Spacer(1,8),
+        Paragraph(title, S_h2),
+        HRFlowable(width=W,thickness=0.5,color=GREEN_MID,spaceAfter=4),
+    ]
+
+    story=[]
+
+    # ── Cover banner ──────────────────────────────────────────────────────────
+    banner_data=[[
+        Paragraph("SP Optimizer", S_title),
+        Paragraph("Renewable Energy System Design Report", S_sub),
+    ]]
+    banner=Table(banner_data,colWidths=[W*0.55,W*0.45])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),GREEN_DARK),
+        ("TOPPADDING",(0,0),(-1,-1),14),("BOTTOMPADDING",(0,0),(-1,-1),14),
+        ("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1,6))
+
+    # Meta info row
+    now=datetime.now().strftime("%d %B %Y")
+    meta=[[
+        Paragraph(f"<b>Location:</b> {location_name}  ({lat:.4f}°N, {lon:.4f}°E)",S_small),
+        Paragraph(f"<b>Date:</b> {now}",S_small),
+        Paragraph(f"<b>Utility:</b> {utility}",S_small),
+    ]]
+    mt=Table(meta,colWidths=[W*0.45,W*0.25,W*0.30])
+    mt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),GREEN_LIGHT),
+        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
+        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED)]))
+    story.append(mt)
+    story.append(Spacer(1,10))
+
+    # ── Recommended source badge ──────────────────────────────────────────────
+    badge_col={"solar":GREEN_MID,"wind":colors.HexColor("#185FA5"),"hybrid":colors.HexColor("#534AB7")}.get(r["badge"],GREEN_MID)
+    rec=Table([[Paragraph(f"Recommended: {r['source']}", sty("RC",fontSize=11,fontName="Helvetica-Bold",textColor=WHITE))]],
+        colWidths=[W])
+    rec.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),badge_col),
+        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
+        ("LEFTPADDING",(0,0),(-1,-1),10),("ROUNDEDCORNERS",[4,4,4,4])]))
+    story.append(rec)
+    story.append(Spacer(1,8))
+
+    # Summary text
+    story.append(Paragraph(
+        f"Based on NASA POWER climate data (GHI {climate.get('psh','—')} kWh/m²/day, "
+        f"wind {climate.get('ws50','—')} m/s @ 50m), the optimal solution is {r['source']}. "
+        f"The {fmt(r['act_kwp'],1)} kWp system will generate {fmt(r['ann_gen_mwh'],1)} MWh/year, "
+        f"covering {r['self_s']}% of the {fmt(r['daily_kwh'],1)} kWh/day demand at "
+        f"a performance ratio of {r['pr']}%. At {int(r['tariff_aed']*100)} fils/kWh, "
+        f"the project achieves a {r['payback']}-year payback and {r['irr']}% IRR over {r['life']} years.",
+        S_body))
+    story.append(Spacer(1,10))
+
+    # ── AREA SECTION (prominent) ──────────────────────────────────────────────
+    story += section("📐 REQUIRED SITE AREA")
+
+    area_data=[
+        ["Parameter","Value","Notes"],
+        ["PV module active area",f"{fmt(r['panel_m2'],1)} m²","Physical area of all PV panels"],
+        ["Array footprint (GCR = {:.2f})".format(r['gcr']),f"{fmt(r['array_m2'],1)} m²","Panel area ÷ ground cover ratio"],
+        ["Land buffer factor",f"{MOUNTING_TYPES[mounting_choice]['land_buffer']}×","Access roads, inverter pads, fencing"],
+        ["Site setback / unusable",f"{setback_pct}%","Excluded from usable area"],
+        ["TOTAL SITE AREA REQUIRED",f"{fmt(r['site_m2'],0)} m²","MINIMUM land to implement the system"],
+        ["In hectares",f"{fmt(r['site_ha'],3)} ha","1 ha = 10,000 m²"],
+        ["Area per kWp (array)",f"{fmt(r['arr_m2_kwp'],1)} m²/kWp","Array footprint per kWp installed"],
+        ["Area per kWp (total site)",f"{fmt(r['site_m2_kwp'],1)} m²/kWp","Total site per kWp installed"],
+    ]
+    if avail_m2 and avail_m2>0:
+        area_data.append(["Available area entered",f"{fmt(avail_m2,0)} m²","Provided by user"])
+        if not r["area_ok"]:
+            area_data.append(["⚠ Area feasibility",f"INSUFFICIENT — max {fmt(r['max_kwp_area'],0)} kWp fits","Increase area or use higher-efficiency module"])
         else:
-            hi = mid
-        if hi - lo < 1e-6:
-            break
-    return (lo + hi) / 2 * 100
+            area_data.append(["Area feasibility","✓ SUFFICIENT","System fits within available area"])
 
+    at=Table(area_data,colWidths=[W*0.40,W*0.25,W*0.35])
+    ts2=TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),GREEN_DARK),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),8.5),
+        ("FONTNAME",(0,1),(-1,-1),"Helvetica"),("FONTSIZE",(0,1),(-1,-1),8.5),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
+        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+        # Highlight total row
+        ("BACKGROUND",(0,5),(-1,5),colors.HexColor("#D4EDDA")),
+        ("FONTNAME",(0,5),(-1,5),"Helvetica-Bold"),
+        ("FONTSIZE",(0,5),(-1,5),9),
+        ("BACKGROUND",(0,6),(-1,6),colors.HexColor("#D4EDDA")),
+        ("FONTNAME",(0,6),(-1,6),"Helvetica-Bold"),
+    ])
+    at.setStyle(ts2)
+    story.append(at)
+    story.append(Spacer(1,4))
+    story.append(Paragraph(
+        f"Mounting: {mounting_choice.split('—')[0].strip()}  ·  "
+        f"Modules: {num_pan_global} × {MODULE_SPECS[module_choice]['wp']} Wp ({module_choice.split(' (')[0]})  ·  "
+        f"GCR: {r['gcr']}",S_note))
+    story.append(Spacer(1,10))
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CORE ENGINEERING CALCULATOR
-# ═════════════════════════════════════════════════════════════════════════════
+    # ── KPI summary table ─────────────────────────────────────────────────────
+    story += section("📊 KEY PERFORMANCE INDICATORS")
 
-def calculate(connected_kw, ptype, climate, grid_type, oversizing_factor,
-              tariff_cents=None, wacc_pct=None, life_yrs=None, degradation_pct=None,
-              lat=0, lon=0):
+    kpi_rows=[
+        ["Indicator","Value","Indicator","Value"],
+        ["Renewable capacity",f"{fmt(r['act_kwp'],1)} kWp","Self-sufficiency",f"{r['self_s']}%"],
+        ["Annual generation",f"{fmt(r['ann_gen_mwh'],1)} MWh/yr","Capacity factor",f"{r['cap_f']}%"],
+        ["Specific yield",f"{fmt(r['spec_yld'],0)} kWh/kWp/yr","Performance ratio (PR)",f"{r['pr']}%"],
+        ["Total CAPEX",aed_s(r['total_cap']),"CAPEX per Wp",f"AED {r['cap_wp']:.2f}/Wp"],
+        ["LCOE",f"AED {r['lcoe']:.0f}/MWh ({r['lcoe']/10:.1f} fils/kWh)","Tariff (avoided cost)",f"{int(r['tariff_aed']*100)} fils/kWh"],
+        ["Simple payback",f"{r['payback']} years","Project IRR",f"{r['irr']}%" if r['irr'] else "—"],
+        [f"NPV ({r['life']} yr)",aed_s(r['npv']),"Equity IRR",f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
+        ["CO₂ offset / year",f"{fmt(r['co2_yr'],1)} tonnes/yr","Households powered",fmt(r['hh'])],
+        ["Site area required",f"{fmt(r['site_m2'],0)} m²  ({fmt(r['site_ha'],3)} ha)","Panels required",fmt(r['num_pan'])],
+    ]
+    kt=Table(kpi_rows,colWidths=[W*0.28,W*0.22,W*0.28,W*0.22])
+    kt.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),GREEN_DARK),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),8.5),
+        ("BACKGROUND",(2,1),(-1,-1),colors.HexColor("#F0FAF6")),
+        ("FONTNAME",(0,1),(-1,-1),"Helvetica"),("FONTSIZE",(0,1),(-1,-1),8.5),
+        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
+        ("FONTNAME",(3,1),(3,-1),"Helvetica-Bold"),
+        ("ROWBACKGROUNDS",(0,1),(1,-1),[WHITE,GRAY_LIGHT]),
+        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+    ]))
+    story.append(kt)
+    story.append(Spacer(1,10))
 
-    p = TYPE_PARAMS[ptype]
+    # ── Climate data ──────────────────────────────────────────────────────────
+    story += section("🛰️ CLIMATE DATA")
+    src_note = "NASA POWER Climatology API (2001–2022, 22-year average)"
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        src_note += "  ·  PVGIS 5.2 EU JRC (yield cross-check)"
+    story.append(Paragraph(f"Source: {src_note}", S_note))
+    story.append(Spacer(1,4))
 
-    # ── Climate values ────────────────────────────────────────────────────────
-    psh       = climate.get("psh", 5.0)
-    temp      = climate.get("temp", 25.0)
-    wind_50m  = climate.get("wind_50m", 5.0)
-    ghi_ann   = climate.get("ghi_annual", psh * 365)
+    crows=[
+        ["Parameter","Value","Parameter","Value"],
+        ["Daily GHI",f"{climate.get('psh','—')} kWh/m²/day","Annual GHI",f"{climate.get('ghi_annual','—')} kWh/m²/yr"],
+        ["Peak sun hours",f"{climate.get('psh','—')} hrs/day","Clearness index (Kt)",str(climate.get('clearness','—'))],
+        ["Wind speed @ 50m",f"{climate.get('ws50','—')} m/s","Wind speed @ 80m",f"{climate.get('ws80','—')} m/s"],
+        ["Avg temperature",f"{climate.get('temp','—')} °C","Max temperature",f"{climate.get('temp_max','—')} °C"],
+        ["Avg humidity",f"{climate.get('humidity','—')} %","PVGIS yield check",
+         f"{fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "Not available"],
+    ]
+    ct=Table(crows,colWidths=[W*0.28,W*0.22,W*0.28,W*0.22])
+    ct.setStyle(table_style())
+    story.append(ct)
+    story.append(Spacer(1,10))
 
-    # ── Source recommendation ─────────────────────────────────────────────────
-    solar_score = psh / 6.0      # normalised to excellent (6 PSH = score 1.0)
-    wind_score  = wind_50m / 8.0  # normalised to excellent (8 m/s = score 1.0)
+    # ── Technical specs ───────────────────────────────────────────────────────
+    story += section("⚙️ TECHNICAL SPECIFICATIONS")
 
-    if solar_score >= 0.7 and wind_score >= 0.75:
-        source     = "Solar PV + Wind Hybrid"
-        badge      = "hybrid"
-        solar_frac = 0.70
-        wind_frac  = 0.30
-    elif wind_score > solar_score and wind_score >= 0.75:
-        source     = "Onshore Wind"
-        badge      = "wind"
-        solar_frac = 0.0
-        wind_frac  = 1.0
-    else:
-        source     = "Solar PV"
-        badge      = "solar"
-        solar_frac = 1.0
-        wind_frac  = 0.0
+    # PV module
+    pv_rows=[
+        ["PV Module & System",""],
+        ["Module technology",module_choice.split(" (")[0]],
+        ["Module wattage",f"{MODULE_SPECS[module_choice]['wp']} Wp"],
+        ["Module efficiency",f"{MODULE_SPECS[module_choice]['eff']*100:.1f}%"],
+        ["Temp. coefficient",f"{MODULE_SPECS[module_choice]['temp_coef']*100:.3f}%/°C"],
+        ["Number of panels",fmt(r['num_pan'])],
+        ["DC system capacity",f"{fmt(r['act_kwp'],1)} kWp"],
+        ["Mounting system",mounting_choice],
+        ["GCR",f"{r['gcr']}  ({int(r['gcr']*100)}% ground coverage)"],
+        ["Panel orientation",azimuth],
+        ["Fixed tilt angle",f"{tilt_angle}°"],
+        ["Soiling loss",f"{soiling_loss}%"],
+        ["Ground albedo",f"{ground_albedo}%"],
+        ["Cell temp (avg operating)",f"{r['cell_temp']}°C"],
+        ["Temp. derating vs STC",f"−{r['temp_dera']}%"],
+        ["Bifacial / albedo gain",f"+{r['bifacial_g']}%" if r['bifacial_g']>0 else "N/A"],
+        ["Performance ratio (PR)",f"{r['pr']}%"],
+        ["Specific yield",f"{fmt(r['spec_yld'],0)} kWh/kWp/yr"],
+        ["Annual degradation",f"{r['degr']}%/yr"],
+    ]
+    pv_t=Table(pv_rows,colWidths=[W*0.55,W*0.45])
+    pv_t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
+        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
+        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
+    ]))
 
-    if grid_type == "Off-grid":
-        bess_hours = max(p["bess_hours"], 48)
-    elif grid_type == "Hybrid + BESS":
-        bess_hours = max(p["bess_hours"], 4)
-    else:
-        bess_hours = p["bess_hours"]
+    # Inverter & BESS
+    inv_rows=[["Inverter & BESS",""],
+        ["Inverter type",inverter_choice.split("(")[0].strip()],
+        ["Inverter efficiency",f"{INVERTER_TYPES[inverter_choice]['eff']*100:.1f}%"],
+        ["Grid connection",grid_type],
+        ["Net metering","Yes" if r['net_metering'] else "No"],
+    ]
+    if r['bess_kwh']>0:
+        inv_rows+=[
+            ["Battery chemistry",bess_chem],
+            ["BESS capacity",f"{fmt(r['bess_kwh'],1)} kWh"],
+            ["BESS power",f"{fmt(r['bess_kw'],1)} kW"],
+            ["BESS duration",f"{r['bess_h']} hours"],
+            ["BESS CAPEX",aed_s(r['bess_cap_aed'])],
+        ]
+    iv_t=Table(inv_rows,colWidths=[W*0.55,W*0.45])
+    iv_t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
+        ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
+        ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+        ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
+    ]))
 
-    # ── Demand & sizing ───────────────────────────────────────────────────────
-    daily_demand_kwh = connected_kw * p["op_hours"]      # kWh/day
+    side=Table([[pv_t,Spacer(0.3*cm,1),iv_t]],colWidths=[W*0.52,0.3*cm,W*0.48])
+    side.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
+    story.append(side)
+    story.append(Spacer(1,10))
 
-    # Temperature derating (Pmax coefficient -0.35%/°C above 25°C)
-    temp_derating = 1.0 + (temp - 25.0) * (-0.0035)
-    temp_derating = max(0.80, min(1.05, temp_derating))
+    # ── Financial ─────────────────────────────────────────────────────────────
+    story += section("💰 FINANCIAL ANALYSIS (AED)")
 
-    # Performance ratio
-    inv_eff    = 0.975
-    wiring_eff = 0.980
-    mismatch   = 0.980
-    pr = temp_derating * p["soiling"] * inv_eff * wiring_eff * mismatch
-    pr = round(pr, 3)
-
-    # Minimum system capacity then oversize
-    if psh > 0:
-        min_capacity_kwp = daily_demand_kwh / (psh * pr)
-    else:
-        min_capacity_kwp = connected_kw * 1.5
-    system_kwp = min_capacity_kwp * oversizing_factor
-
-    # Split for hybrid
-    solar_kwp = system_kwp * solar_frac
-    wind_kw   = system_kwp * wind_frac  # rated wind capacity
-
-    # ── Panel count ───────────────────────────────────────────────────────────
-    num_panels = math.ceil((solar_kwp * 1000) / p["pv_wp"]) if solar_kwp > 0 else 0
-    actual_solar_kwp = (num_panels * p["pv_wp"]) / 1000
-
-    # ── Annual generation ─────────────────────────────────────────────────────
-    degradation  = (degradation_pct or 0.5) / 100
-    annual_solar = actual_solar_kwp * psh * 365 * pr if actual_solar_kwp > 0 else 0
-
-    # Wind: simplified AEP using Rayleigh distribution approximation
-    if wind_kw > 0:
-        wind_cf    = min(0.45, max(0.15, (wind_50m / 13) ** 3 * 0.45))
-        annual_wind = wind_kw * wind_cf * 8760
-    else:
-        wind_cf    = 0
-        annual_wind = 0
-
-    annual_gen_kwh = annual_solar + annual_wind
-
-    # Self-sufficiency
-    annual_demand = daily_demand_kwh * 365
-    self_suff     = min(100.0, annual_gen_kwh / annual_demand * 100) if annual_demand > 0 else 100.0
-
-    # Specific yield & capacity factor
-    specific_yield = (annual_solar / actual_solar_kwp) if actual_solar_kwp > 0 else 0
-    total_cap_kw   = actual_solar_kwp + wind_kw
-    cap_factor     = (annual_gen_kwh / (total_cap_kw * 8760) * 100) if total_cap_kw > 0 else 0
-
-    # ── Inverter ──────────────────────────────────────────────────────────────
-    inv_capacity_kva = actual_solar_kwp / p["dc_ac"] if actual_solar_kwp > 0 else 0
-    inv_units = math.ceil(inv_capacity_kva / 5000) if inv_capacity_kva > 5000 else max(1, math.ceil(inv_capacity_kva / 110))
-
-    # ── BESS ──────────────────────────────────────────────────────────────────
-    if bess_hours > 0:
-        bess_kwh = connected_kw * (bess_hours / 24) * daily_demand_kwh / max(connected_kw, 1)
-        bess_kwh = connected_kw * (bess_hours / p["op_hours"])
-        bess_kw  = connected_kw
-        bess_capex = bess_kwh * 260   # USD/kWh LFP 2024
-    else:
-        bess_kwh = bess_kw = bess_capex = 0
-
-    # ── Land area ─────────────────────────────────────────────────────────────
-    land_m2  = actual_solar_kwp * p["land_m2_kwp"]
-    land_ha  = land_m2 / 10_000
-
-    # ── Financial model ───────────────────────────────────────────────────────
-    capex_solar = actual_solar_kwp * 1000 * p["capex_wp"]
-    capex_wind  = wind_kw * 1000 * 1.20   # USD/kW for onshore wind
-    total_capex = capex_solar + capex_wind + bess_capex
-
-    tariff_usd = (tariff_cents / 100) if tariff_cents else estimate_tariff(lat, lon)
-    wacc       = (wacc_pct or 7.0)
-    life       = int(life_yrs or 25)
-
-    annual_opex   = total_capex * 0.010         # 1% of CAPEX
-    year1_revenue = annual_gen_kwh * tariff_usd
-    year1_net     = year1_revenue - annual_opex
-
-    # Build cashflows with degradation
-    cashflows = [-total_capex]
-    for yr in range(1, life + 1):
-        gen_yr  = annual_gen_kwh * ((1 - degradation) ** (yr - 1))
-        rev_yr  = gen_yr * tariff_usd
-        opex_yr = annual_opex * (1.02 ** (yr - 1))   # 2% opex inflation
-        cashflows.append(rev_yr - opex_yr)
-
-    npv_val    = npv_calc(cashflows[1:], wacc) - total_capex
-    irr_val    = irr_calc(cashflows)
-    payback    = total_capex / year1_net if year1_net > 0 else 99
-
-    # LCOE
-    total_gen_lifetime = sum(annual_gen_kwh * ((1 - degradation) ** yr) for yr in range(life))
-    total_cost_pv      = total_capex + npv_calc([annual_opex * (1.02 ** yr) for yr in range(life)], wacc)
-    lcoe_usd_mwh       = (total_cost_pv / total_gen_lifetime * 1000) if total_gen_lifetime > 0 else 0
-
-    # CAPEX breakdown %
-    cb = {}
-    if total_capex > 0:
-        cb["modules"]      = round(capex_solar * 0.38 / total_capex * 100, 1)
-        cb["inverters"]    = round(capex_solar * 0.12 / total_capex * 100, 1)
-        cb["mounting"]     = round(capex_solar * 0.18 / total_capex * 100, 1)
-        cb["bos_elec"]     = round(capex_solar * 0.15 / total_capex * 100, 1)
-        cb["epc"]          = round(capex_solar * 0.10 / total_capex * 100, 1)
-        cb["contingency"]  = round(100 - cb["modules"] - cb["inverters"] - cb["mounting"] - cb["bos_elec"] - cb["epc"], 1)
+    fin_l=[["Capital expenditure",""],
+        ["Total CAPEX",aed_s(r['total_cap'])],
+        ["CAPEX per Wp",f"AED {r['cap_wp']:.2f}/Wp"],
+    ]+[[f"  {k}",f"{v}%"] for k,v in r['cb'].items() if v>0]+[
+        ["Equity required",aed_s(r['eq_aed'])],
+        ["Project debt",aed_s(r['dbt_aed'])],
+        ["Annual O&M",aed_s(r['ann_opex'])],
+    ]
+    fin_r=[["Financial returns",""],
+        ["Tariff",f"{int(r['tariff_aed']*100)} fils/kWh"],
+        ["Year-1 gross revenue",aed_s(r['y1rev'])],
+        ["Year-1 net income",aed_s(r['y1net'])],
+        ["LCOE",f"AED {r['lcoe']:.0f}/MWh ({r['lcoe']/10:.1f} fils/kWh)"],
+        ["Simple payback",f"{r['payback']} years"],
+        ["Project IRR",f"{r['irr']}%" if r['irr'] else "—"],
+        ["Equity IRR",f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
+        [f"NPV ({r['life']} yr, {r['wacc']}% WACC)",aed_s(r['npv'])],
+        ["DSCR (year 1)",f"{r['dscr']}×" if r['dscr'] else "N/A"],
+        ["Annual debt service",aed_s(r['ann_ds']) if r['ann_ds']>0 else "—"],
+        ["Carbon credit revenue",f"{aed_s(r['co2_rev'])}/yr"],
+    ]
+    def make_2col(rows):
+        t=Table(rows,colWidths=[W*0.52/1.0*0.55,W*0.52/1.0*0.45])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),GREEN_MID),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8.5),
+            ("FONTNAME",(1,1),(1,-1),"Helvetica-Bold"),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,GRAY_LIGHT]),
+            ("GRID",(0,0),(-1,-1),0.3,GRAY_MED),
+            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+            ("SPAN",(0,0),(1,0)),("ALIGN",(0,0),(1,0),"CENTER"),
+        ]))
+        return t
+    fin_side=Table([[make_2col(fin_l),Spacer(0.3*cm,1),make_2col(fin_r)]],
+        colWidths=[W*0.48,0.3*cm,W*0.52-0.3*cm])
+    fin_side.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
+    story.append(fin_side)
+    story.append(Spacer(1,10))
 
     # ── Sustainability ────────────────────────────────────────────────────────
-    emission_factor     = estimate_grid_emission_factor(lat, lon)
-    co2_annual          = annual_gen_kwh * emission_factor / 1000   # tonnes
-    co2_lifetime        = co2_annual * life
-    households          = int(annual_gen_kwh / 4000)                  # avg 4 MWh/yr per household
+    story += section("🌱 SUSTAINABILITY & ENVIRONMENTAL IMPACT")
+    sus_rows=[
+        ["CO₂ avoided per year",f"{fmt(r['co2_yr'],1)} tonnes/yr"],
+        [f"CO₂ avoided over {r['life']} years",f"{fmt(r['co2_lf'],0)} tonnes"],
+        ["UAE households powered per year",fmt(r['hh'])],
+        ["Carbon credit value",f"{aed_s(r['co2_rev'])}/yr (at AED {carbon_price:.0f}/tonne)"],
+        ["Grid emission factor","0.341 kgCO₂/kWh (DEWA Clean Energy Report 2023)"],
+        ["UAE Net Zero alignment","Supports UAE 2050 Net Zero Strategy & 44% clean energy target by 2050"],
+        ["SDG alignment","SDG 7 (Clean Energy)  ·  SDG 11 (Sustainable Cities)  ·  SDG 13 (Climate Action)"],
+    ]
+    story.append(kv_table(sus_rows,[W*0.50,W*0.50]))
+    story.append(Spacer(1,10))
 
-    # ── Wind specs ────────────────────────────────────────────────────────────
-    if wind_kw > 0:
-        turbine_kw  = 3000 if wind_kw > 10000 else (1500 if wind_kw > 2000 else 500)
-        num_turbines = max(1, math.ceil(wind_kw / turbine_kw))
-        hub_height  = 100 if turbine_kw >= 3000 else (80 if turbine_kw >= 1500 else 55)
-        rotor_d     = 126 if turbine_kw >= 3000 else (90 if turbine_kw >= 1500 else 54)
-    else:
-        turbine_kw = num_turbines = hub_height = rotor_d = 0
+    # ── Risks & next steps ────────────────────────────────────────────────────
+    story += section("⚠️ KEY RISKS & MITIGATIONS")
+    risk_rows=[
+        ["Risk","Mitigation"],
+        ["Soiling & dust (UAE desert)","Bi-weekly dry cleaning or robotic auto-cleaning system"],
+        [f"High cell temperature ({r['cell_temp']}°C operating)","Specify TOPCon/HJT with temp. coeff. ≤−0.30%/°C"],
+        ["Grid curtailment by DEWA/SEWA","Include active power control in inverter spec; consider BESS"],
+        ["Tariff / regulatory risk","Lock in net metering agreement or PPA before financial close"],
+        ["Sand abrasion on AR coating","Specify anti-soiling glass; IEC 61215 / IP67 rated junction boxes"],
+    ]
+    rkt=Table(risk_rows,colWidths=[W*0.40,W*0.60])
+    rkt.setStyle(table_style())
+    story.append(rkt)
+    story.append(Spacer(1,10))
 
-    # ── Climate assessment ────────────────────────────────────────────────────
-    if psh >= 5.5:
-        solar_suit = f"Excellent — GHI of {psh:.2f} kWh/m²/day is well above the global solar project threshold of 4.5"
-    elif psh >= 4.5:
-        solar_suit = f"Good — GHI of {psh:.2f} kWh/m²/day supports viable solar PV with competitive LCOE"
-    elif psh >= 3.5:
-        solar_suit = f"Moderate — GHI of {psh:.2f} kWh/m²/day is workable but will result in higher LCOE than solar-rich regions"
-    else:
-        solar_suit = f"Low — GHI of {psh:.2f} kWh/m²/day may favour wind or hybrid over pure solar"
+    story += section("✅ RECOMMENDED NEXT STEPS")
+    steps=[
+        f"Submit interconnection / net metering application to {utility.split('(')[0].strip()} (Shams Dubai portal for DEWA)",
+        f"Commission bankable P50/P90 energy yield assessment for {location_name} — required for project finance",
+        f"Appoint DEWA/Trakhees-approved EPC contractor; obtain No Objection Certificate (NOC)",
+        f"Confirm site land availability: {fmt(r['site_m2'],0)} m² ({fmt(r['site_ha'],2)} ha) minimum required",
+        f"Develop lender-ready financial model using P90 scenario — target DSCR ≥ 1.20× (current estimate: {r['dscr']}×)" if r['dscr'] else "Develop lender-ready financial model with P90 scenario",
+    ]
+    for i,s in enumerate(steps,1):
+        story.append(Paragraph(f"{i}.  {s}", S_body))
+        story.append(Spacer(1,3))
+    story.append(Spacer(1,8))
 
-    if wind_50m >= 8.0:
-        wind_suit = f"Excellent — {wind_50m} m/s at 50m hub height offers high capacity factors (>35%)"
-    elif wind_50m >= 6.5:
-        wind_suit = f"Good — {wind_50m} m/s at 50m supports viable onshore wind development"
-    elif wind_50m >= 5.0:
-        wind_suit = f"Moderate — {wind_50m} m/s is borderline for wind; solar is likely more economic at this site"
-    else:
-        wind_suit = f"Low — {wind_50m} m/s wind speed makes wind turbines uneconomic at this location"
+    # ── Footer note ───────────────────────────────────────────────────────────
+    story.append(HRFlowable(width=W,thickness=0.5,color=GRAY_MED))
+    story.append(Spacer(1,4))
+    story.append(Paragraph(
+        f"Report generated: {now}  ·  Climate data: NASA POWER API (2001–2022)"
+        + ("  ·  PVGIS 5.2 JRC" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "")
+        + "  ·  Tariffs: DEWA/SEWA/FEWA 2024  ·  SP Optimizer UAE Edition",
+        sty("FT",fontSize=7,fontName="Helvetica-Oblique",textColor=colors.HexColor("#aaaaaa"))))
 
-    temp_diff = temp - 25.0
-    if temp_diff > 0:
-        temp_note = f"At {temp}°C average, panels operate {temp_diff:.1f}°C above STC. This causes a {abs(temp_diff * 0.35):.1f}% power reduction. TOPCon bifacial modules with low temp coefficient (−0.29%/°C) are recommended to minimise losses."
-    else:
-        temp_note = f"At {temp}°C average, panels operate near or below STC (25°C), providing a slight efficiency advantage over nameplate ratings."
+    doc.build(story)
+    buf.seek(0)
+    return buf
 
-    return {
-        "source": source, "badge": badge,
-        "solar_frac": solar_frac, "wind_frac": wind_frac,
-        "system_kwp": round(system_kwp, 1),
-        "solar_kwp": round(actual_solar_kwp, 1),
-        "wind_kw": round(wind_kw, 1),
-        "num_panels": num_panels,
-        "pv_wp": p["pv_wp"],
-        "pv_eff": p["pv_eff"] * 100,
-        "pr": round(pr * 100, 1),
-        "temp_derating": round((1 - temp_derating) * 100, 2),
-        "annual_gen_kwh": round(annual_gen_kwh, 0),
-        "annual_gen_mwh": round(annual_gen_kwh / 1000, 1),
-        "annual_demand_kwh": round(annual_demand, 0),
-        "self_suff": round(self_suff, 1),
-        "cap_factor": round(cap_factor, 1),
-        "specific_yield": round(specific_yield, 0),
-        "land_ha": round(land_ha, 2),
-        "land_m2_kwp": p["land_m2_kwp"],
-        "dc_ac": p["dc_ac"],
-        "inv_kva": round(inv_capacity_kva, 1),
-        "inv_units": inv_units,
-        "bess_kwh": round(bess_kwh, 1),
-        "bess_kw": round(bess_kw, 1),
-        "bess_hours": round(bess_kwh / bess_kw, 1) if bess_kw > 0 else 0,
-        "bess_capex": round(bess_capex, 0),
-        "total_capex": round(total_capex, 0),
-        "total_capex_m": round(total_capex / 1_000_000, 2),
-        "capex_per_kwp": round(total_capex / system_kwp / 1000, 2) if system_kwp > 0 else 0,
-        "annual_opex": round(annual_opex, 0),
-        "opex_per_mwh": round(annual_opex / (annual_gen_kwh / 1000), 2) if annual_gen_kwh > 0 else 0,
-        "tariff_usd": tariff_usd,
-        "year1_revenue": round(year1_revenue, 0),
-        "year1_net": round(year1_net, 0),
-        "npv": round(npv_val, 0),
-        "irr": round(irr_val, 1),
-        "payback": round(payback, 1),
-        "lcoe": round(lcoe_usd_mwh, 2),
-        "wacc": wacc, "life": life,
-        "cb": cb,
-        "co2_annual": round(co2_annual, 1),
-        "co2_lifetime": round(co2_lifetime, 0),
-        "households": households,
-        "emission_factor": emission_factor,
-        "turbine_kw": turbine_kw, "num_turbines": num_turbines,
-        "hub_height": hub_height, "rotor_d": rotor_d, "wind_cf": round(wind_cf * 100, 1),
-        "solar_suit": solar_suit, "wind_suit": wind_suit, "temp_note": temp_note,
-        "op_hours": p["op_hours"],
-        "daily_demand": round(daily_demand_kwh, 1),
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMLIT DISPLAY RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+def render_screen(r, climate, pvgis_data, location_name, lat, lon,
+                  connected_power, power_unit, project_label, utility, mounting_choice):
 
+    bc={"solar":"badge-solar","wind":"badge-wind","hybrid":"badge-hybrid"}.get(r["badge"],"badge-solar")
+    st.markdown(f'<span class="badge {bc}">{r["source"]}</span>', unsafe_allow_html=True)
+    pvgis_note="PVGIS JRC" if r["pvgis_used"] else "NASA model"
+    st.markdown(
+        f"**{fmt(r['act_kwp'],1)} kWp** system · {fmt(r['ann_gen_mwh'],1)} MWh/yr · "
+        f"{r['self_s']}% self-sufficiency · PR {r['pr']}% · "
+        f"{r['payback']} yr payback · {r['irr']}% IRR · yield source: {pvgis_note}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# RESULTS RENDERER
-# ═════════════════════════════════════════════════════════════════════════════
+    # ── BIG AREA CARD ─────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="area-hero">
+      <h2>📐 Required site area for implementation</h2>
+    """, unsafe_allow_html=True)
 
-def fmt_num(n, decimals=0):
-    if n is None:
-        return "—"
-    if decimals == 0:
-        return f"{int(round(n)):,}"
-    return f"{round(n, decimals):,.{decimals}f}"
+    ac1,ac2,ac3,ac4,ac5 = st.columns(5)
+    ac1.markdown(f'<div class="area-stat"><div class="av">{fmt(r["panel_m2"],0)}</div><div class="al">Panel area (m²)</div></div>', unsafe_allow_html=True)
+    ac2.markdown(f'<div class="area-stat"><div class="av">{fmt(r["array_m2"],0)}</div><div class="al">Array footprint (m²)</div></div>', unsafe_allow_html=True)
+    ac3.markdown(f'<div class="area-stat"><div class="av">{fmt(r["site_m2"],0)}</div><div class="al">Total site (m²)</div></div>', unsafe_allow_html=True)
+    ac4.markdown(f'<div class="area-stat"><div class="av">{fmt(r["site_ha"],3)}</div><div class="al">Total site (ha)</div></div>', unsafe_allow_html=True)
+    ac5.markdown(f'<div class="area-stat"><div class="av">{fmt(r["site_m2_kwp"],1)}</div><div class="al">m² per kWp</div></div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-def render(r, climate, location_name, lat, lon, connected_power, power_unit, project_label):
-    badge_cls = {"solar":"badge-solar","wind":"badge-wind","hybrid":"badge-hybrid"}.get(r["badge"],"badge-solar")
-    st.markdown(f'<span class="badge {badge_cls}">{r["source"]}</span>', unsafe_allow_html=True)
+    if not r["area_ok"] and r["max_kwp_area"]:
+        st.markdown(f'<div class="area-warn">⚠️ Your available area ({fmt(avail_m2_g,0)} m²) can fit max <b>{fmt(r["max_kwp_area"],0)} kWp</b> — below the required {fmt(r["act_kwp"],0)} kWp. Consider a higher-efficiency module or single-axis tracker.</div>', unsafe_allow_html=True)
+    elif avail_m2_g and avail_m2_g > 0:
+        st.success(f"✅ Available area ({fmt(avail_m2_g,0)} m²) is sufficient for the {fmt(r['act_kwp'],0)} kWp system.")
 
-    # Executive summary
-    tariff_display = f"{r['tariff_usd']*100:.1f}¢/kWh"
-    st.markdown(f"""
-Based on NASA POWER climate data for this site (GHI {climate.get('psh','—')} kWh/m²/day, wind {climate.get('wind_50m','—')} m/s at 50m), 
-**{r['source']}** is the optimal technology for this {project_label.split()[-1].lower()} project. 
-The {fmt_num(r['system_kwp'])} kWp system will generate **{fmt_num(r['annual_gen_mwh'])} MWh/year**, 
-covering **{r['self_suff']}%** of the {fmt_num(r['daily_demand'])} kWh/day load. 
-At the estimated grid tariff of {tariff_display}, the project achieves a **{r['payback']} year payback** 
-with a **{r['irr']}% IRR** over {r['life']} years.
-    """)
+    # Area breakdown detail
+    with st.expander("📐 Area breakdown detail"):
+        ad1,ad2 = st.columns(2)
+        ad1.markdown(f"""
+| Component | Value |
+|---|---|
+| Panels | {fmt(r['num_pan'])} × {MODULE_SPECS[module_choice]['wp']} Wp |
+| Panel area each | {round(MODULE_SPECS[module_choice]['wp']/1000/MODULE_SPECS[module_choice]['eff'],2)} m² |
+| Total panel area | **{fmt(r['panel_m2'],1)} m²** |
+| GCR | {r['gcr']} ({int(r['gcr']*100)}% coverage) |
+| Array footprint | **{fmt(r['array_m2'],1)} m²** |
+        """)
+        ad2.markdown(f"""
+| Component | Value |
+|---|---|
+| Land buffer factor | {MOUNTING_TYPES[mounting_choice]['land_buffer']}× |
+| Setback / unusable | {setback_pct}% |
+| Total site area | **{fmt(r['site_m2'],0)} m²** |
+| In hectares | **{fmt(r['site_ha'],3)} ha** |
+| Array m²/kWp | {fmt(r['arr_m2_kwp'],1)} m²/kWp |
+| Site m²/kWp | **{fmt(r['site_m2_kwp'],1)} m²/kWp** |
+        """)
 
-    # Climate assessment
-    st.markdown("**☀️ Solar suitability:** " + r["solar_suit"])
-    st.markdown("**💨 Wind suitability:** " + r["wind_suit"])
-    st.markdown("**🌡️ Temperature impact:** " + r["temp_note"])
-
-    # KPI metrics
+    # ── KPIs ──────────────────────────────────────────────────────────────────
     st.divider()
-    k = st.columns(4)
-    k[0].metric("Renewable capacity",  f"{fmt_num(r['system_kwp'])} kWp")
-    k[1].metric("Annual generation",   f"{fmt_num(r['annual_gen_mwh'])} MWh/yr")
-    k[2].metric("Self-sufficiency",    f"{r['self_suff']}%")
-    k[3].metric("Capacity factor",     f"{r['cap_factor']}%")
-    k = st.columns(4)
-    k[0].metric("Total CAPEX",         f"USD {fmt_num(r['total_capex_m'], 2)}M")
-    k[1].metric("CAPEX per kWp",       f"${fmt_num(r['capex_per_kwp'], 2)}/Wp")
-    k[2].metric("LCOE",                f"${fmt_num(r['lcoe'], 1)}/MWh")
-    k[3].metric("Project IRR",         f"{r['irr']}%")
-    k = st.columns(4)
-    k[0].metric("Simple payback",      f"{r['payback']} years")
-    k[1].metric("NPV ({r['life']} yr)",f"USD {fmt_num(r['npv']/1_000_000, 2)}M")
-    k[2].metric("CO₂ offset / year",   f"{fmt_num(r['co2_annual'])} tonnes")
-    k[3].metric("Land required",       f"{fmt_num(r['land_ha'], 2)} ha")
+    k=st.columns(4)
+    k[0].metric("Renewable capacity",  f"{fmt(r['act_kwp'],1)} kWp")
+    k[1].metric("Annual generation",   f"{fmt(r['ann_gen_mwh'],1)} MWh/yr")
+    k[2].metric("Self-sufficiency",    f"{r['self_s']}%")
+    k[3].metric("Capacity factor",     f"{r['cap_f']}%")
+    k=st.columns(4)
+    k[0].metric("Total CAPEX",         aed_s(r['total_cap']))
+    k[1].metric("CAPEX / Wp",          f"AED {r['cap_wp']:.2f}")
+    k[2].metric("LCOE",                f"AED {r['lcoe']:.0f}/MWh")
+    k[3].metric("Project IRR",         f"{r['irr']}%" if r['irr'] else "—")
+    k=st.columns(4)
+    k[0].metric("Simple payback",      f"{r['payback']} yrs")
+    k[1].metric(f"NPV ({r['life']} yr)",aed_s(r['npv']))
+    k[2].metric("CO₂ offset / year",   f"{fmt(r['co2_yr'],1)} t/yr")
+    k[3].metric("Households powered",  fmt(r['hh']))
 
-    # Technical specs
+    # ── Technical ─────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("Technical specifications")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        with st.expander("☀️ Solar PV specifications", expanded=True):
-            panel_tech = "TOPCon Bifacial N-type" if r["pv_wp"] >= 570 else "Monocrystalline PERC"
-            tracker = "Single-axis tracker (SAT)" if r["system_kwp"] > 500 else "Fixed-tilt ground mount"
-            tilt = "Tracking (0°–55° E-W)" if "SAT" in tracker else f"{abs(round(lat)):.0f}° fixed tilt"
-            rows = [
-                ("Module technology",       panel_tech),
-                ("Module wattage",          f"{r['pv_wp']} Wp"),
-                ("Module efficiency",       f"{r['pv_eff']:.1f}%"),
-                ("Total modules",           f"{fmt_num(r['num_panels'])} panels"),
-                ("Total solar capacity",    f"{fmt_num(r['solar_kwp'], 1)} kWp"),
-                ("Mounting system",         tracker),
-                ("Tilt / tracking",         tilt),
-                ("Performance ratio (PR)",  f"{r['pr']}%"),
-                ("Temp. derating",          f"−{r['temp_derating']}% from STC"),
-                ("Specific yield",          f"{fmt_num(r['specific_yield'])} kWh/kWp/yr"),
-                ("Land use efficiency",     f"{r['land_m2_kwp']} m²/kWp"),
-            ]
-            st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-        if r["bess_kwh"] > 0:
-            with st.expander("🔋 Battery storage (BESS)", expanded=True):
-                rows = [
-                    ("Battery chemistry",     "LFP (Lithium Iron Phosphate)"),
-                    ("Total capacity",        f"{fmt_num(r['bess_kwh'], 1)} kWh"),
-                    ("Power rating",          f"{fmt_num(r['bess_kw'], 1)} kW"),
-                    ("Duration",              f"{r['bess_hours']} hours"),
-                    ("Round-trip efficiency", "92–95%"),
-                    ("Cycle life",            "4,000–6,000 cycles"),
-                    ("Warranty",              "10 years / 70% capacity"),
-                    ("BESS CAPEX",            f"USD {fmt_num(r['bess_capex']/1_000_000, 2)}M"),
-                ]
-                st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-    with col2:
-        with st.expander("⚙️ Inverter & power conversion", expanded=True):
-            inv_type = "Central inverter station (1500 Vdc)" if r["system_kwp"] > 1000 else "String inverter (1000 Vdc)"
-            rows = [
-                ("Inverter type",           inv_type),
-                ("Total inverter capacity", f"{fmt_num(r['inv_kva'], 1)} kVA"),
-                ("Number of units",         f"{r['inv_units']}"),
-                ("DC/AC ratio",             f"{r['dc_ac']}"),
-                ("Inverter efficiency",     "98.5%"),
-                ("MPPT channels",           "Multi-MPPT per unit"),
-            ]
-            st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-        if r["wind_kw"] > 0:
-            with st.expander("💨 Wind turbine specifications", expanded=True):
-                rows = [
-                    ("Turbine class",         f"IEC Class {'I' if r['hub_height'] >= 100 else 'II'}"),
-                    ("Rated power per turbine",f"{fmt_num(r['turbine_kw'])} kW"),
-                    ("Number of turbines",    f"{r['num_turbines']}"),
-                    ("Hub height",            f"{r['hub_height']} m"),
-                    ("Rotor diameter",        f"{r['rotor_d']} m"),
-                    ("Estimated capacity factor", f"{r['wind_cf']}%"),
-                    ("Min. turbine spacing",  f"5–7 rotor diameters"),
-                ]
-                st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-        with st.expander("🔌 Grid & balance of system", expanded=True):
-            col_v = 33 if r["system_kwp"] < 1000 else (132 if r["system_kwp"] < 50000 else 220)
-            rows = [
-                ("Internal collection voltage", f"{col_v} kV"),
-                ("Grid connection type",    "Grid-connected" if r["bess_hours"] == 0 else "Hybrid"),
-                ("Operating hours assumed", f"{r['op_hours']} hrs/day"),
-                ("Daily demand served",     f"{fmt_num(r['daily_demand'])} kWh/day"),
-                ("Annual demand",           f"{fmt_num(r['annual_demand_kwh']/1000, 1)} MWh/yr"),
-                ("Grid export",             "Excess generation exported to grid" if r["self_suff"] < 100 else "Fully self-consumed"),
-            ]
-            st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-    # Financial analysis
-    st.divider()
-    st.subheader("Financial analysis")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.expander("💰 Capital cost breakdown", expanded=True):
-            cb = r["cb"]
-            rows = [
-                ("Total CAPEX",             f"USD {fmt_num(r['total_capex_m'], 2)}M"),
-                ("CAPEX per kWp",           f"${r['capex_per_kwp']:.2f}/Wp"),
-                ("  — Modules / turbines",  f"{cb.get('modules',0)}% of CAPEX"),
-                ("  — Inverters",           f"{cb.get('inverters',0)}%"),
-                ("  — Mounting & civil",    f"{cb.get('mounting',0)}%"),
-                ("  — BOS & electrical",    f"{cb.get('bos_elec',0)}%"),
-                ("  — EPC overhead",        f"{cb.get('epc',0)}%"),
-                ("  — Contingency",         f"{cb.get('contingency',0)}%"),
-                ("BESS cost (if any)",      f"USD {fmt_num(r['bess_capex']/1_000_000, 2)}M"),
-            ]
-            st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-    with col2:
-        with st.expander("📈 Financial returns", expanded=True):
-            rows = [
-                ("Grid tariff assumed",     f"${r['tariff_usd']*100:.1f}¢/kWh"),
-                ("Year-1 revenue",          f"USD {fmt_num(r['year1_revenue']/1_000_000, 2)}M"),
-                ("Annual O&M cost",         f"USD {fmt_num(r['annual_opex']/1_000_000, 3)}M/yr"),
-                ("O&M per MWh",             f"${r['opex_per_mwh']:.2f}/MWh"),
-                ("Year-1 net income",       f"USD {fmt_num(r['year1_net']/1_000_000, 2)}M"),
-                ("LCOE",                    f"${r['lcoe']:.1f}/MWh"),
-                ("Simple payback",          f"{r['payback']} years"),
-                ("Project IRR",             f"{r['irr']}%"),
-                (f"NPV ({r['life']} yr, {r['wacc']}% WACC)", f"USD {fmt_num(r['npv']/1_000_000, 2)}M"),
-            ]
-            st.markdown("<table>" + "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a,b in rows) + "</table>", unsafe_allow_html=True)
-
-    # Sustainability
-    st.divider()
-    st.subheader("Sustainability & environmental impact")
-    k = st.columns(4)
-    k[0].metric("CO₂ offset / year",    f"{fmt_num(r['co2_annual'])} tonnes")
-    k[1].metric("Lifetime CO₂ offset",  f"{fmt_num(r['co2_lifetime'])} tonnes")
-    k[2].metric("Households powered",   f"{fmt_num(r['households'])}")
-    k[3].metric("Grid emission factor", f"{r['emission_factor']} kgCO₂/kWh")
-    st.caption(f"Water: Dry-cleaning recommended in arid climates to minimise water consumption. Estimated < 0.05 m³/MWh.")
-    st.caption(f"SDG alignment: SDG 7 (Affordable & Clean Energy)  ·  SDG 13 (Climate Action)  ·  SDG 11 (Sustainable Cities)")
-
-    # Risks & next steps
-    st.divider()
-    c1, c2 = st.columns(2)
+    c1,c2=st.columns(2)
     with c1:
-        st.subheader("Key risks")
-        risks = [
-            f"☀️ **Soiling losses** — desert/arid sites require frequent panel cleaning (every 2–4 weeks) to maintain PR above {r['pr']-3}%",
-            f"🌡️ **Temperature derating** — at {climate.get('temp','—')}°C average, high-temperature days may reduce output by up to 8–12% vs nameplate",
-            "📋 **Grid curtailment** — utility may limit export during low-demand periods; BESS or load management should be considered",
-            "💰 **Tariff risk** — revenue depends on sustained offtake agreement; merchant exposure increases project risk",
-            "🏗️ **EPC delivery risk** — supply chain for modules and inverters should be secured 12–18 months before COD",
-        ]
-        for risk in risks:
-            st.markdown(f'<p class="bullet">{risk}</p>', unsafe_allow_html=True)
-
+        with st.expander("☀️ PV module & system",expanded=True):
+            rows=[("Module",module_choice.split(" (")[0]),
+                  ("Module wattage",f"{MODULE_SPECS[module_choice]['wp']} Wp"),
+                  ("Efficiency",f"{MODULE_SPECS[module_choice]['eff']*100:.1f}%"),
+                  ("Temp. coefficient",f"{MODULE_SPECS[module_choice]['temp_coef']*100:.3f}%/°C"),
+                  ("Number of panels",fmt(r['num_pan'])),
+                  ("DC capacity",f"{fmt(r['act_kwp'],1)} kWp"),
+                  ("Mounting",mounting_choice.split("—")[0].strip()),
+                  ("GCR",f"{r['gcr']}"),("PR",f"{r['pr']}%"),
+                  ("Cell temp (avg)",f"{r['cell_temp']}°C"),
+                  ("Temp. derating",f"−{r['temp_dera']}%"),
+                  ("Specific yield",f"{fmt(r['spec_yld'],0)} kWh/kWp/yr")]
+            st.markdown("<table>"+"".join(f"<tr><td>{a}</td><td>{b}</td></tr>"for a,b in rows)+"</table>",unsafe_allow_html=True)
+        if r['bess_kwh']>0:
+            with st.expander("🔋 BESS",expanded=True):
+                rows=[("Chemistry",bess_chem),("Capacity",f"{fmt(r['bess_kwh'],1)} kWh"),
+                      ("Power",f"{fmt(r['bess_kw'],1)} kW"),("Duration",f"{r['bess_h']} hrs"),
+                      ("BESS CAPEX",aed_s(r['bess_cap_aed']))]
+                st.markdown("<table>"+"".join(f"<tr><td>{a}</td><td>{b}</td></tr>"for a,b in rows)+"</table>",unsafe_allow_html=True)
     with c2:
-        st.subheader("Mitigations")
-        mits = [
-            "Install automated dry-cleaning robots or anti-soiling coating on modules",
-            f"Specify modules with temp. coefficient better than −0.30%/°C; prefer TOPCon over PERC in climates above {climate.get('temp',25)}°C",
-            "Include grid code compliance study and active power control in inverter spec",
-            "Secure long-term PPA or government feed-in tariff before financial close",
-            "Place equipment orders with 20% deposit upon EPC contract signature",
-        ]
-        for m in mits:
-            st.markdown(f'<p class="bullet">• {m}</p>', unsafe_allow_html=True)
+        with st.expander("💰 Financial breakdown",expanded=True):
+            rows=[("Total CAPEX",aed_s(r['total_cap'])),
+                  ("CAPEX/Wp",f"AED {r['cap_wp']:.2f}"),
+                  ("Tariff",f"{int(r['tariff_aed']*100)} fils/kWh"),
+                  ("Year-1 revenue",aed_s(r['y1rev'])),
+                  ("Year-1 net income",aed_s(r['y1net'])),
+                  ("LCOE",f"AED {r['lcoe']:.0f}/MWh"),
+                  ("Payback",f"{r['payback']} years"),
+                  ("Project IRR",f"{r['irr']}%" if r['irr'] else "—"),
+                  ("Equity IRR",f"{r['eq_irr']}%" if r['eq_irr'] else "—"),
+                  (f"NPV ({r['life']} yr)",aed_s(r['npv'])),
+                  ("DSCR yr-1",f"{r['dscr']}×" if r['dscr'] else "N/A"),
+                  ("CO₂ credit revenue",f"{aed_s(r['co2_rev'])}/yr")]
+            st.markdown("<table>"+"".join(f"<tr><td>{a}</td><td>{b}</td></tr>"for a,b in rows)+"</table>",unsafe_allow_html=True)
+        with st.expander("🌱 Sustainability",expanded=False):
+            rows=[("CO₂ offset/yr",f"{fmt(r['co2_yr'],1)} tonnes"),
+                  ("Lifetime CO₂",f"{fmt(r['co2_lf'],0)} tonnes"),
+                  ("Households powered",fmt(r['hh'])),
+                  ("Carbon credit value",f"{aed_s(r['co2_rev'])}/yr"),
+                  ("Emission factor","0.341 kgCO₂/kWh (DEWA 2023)")]
+            st.markdown("<table>"+"".join(f"<tr><td>{a}</td><td>{b}</td></tr>"for a,b in rows)+"</table>",unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("Recommended next steps")
-    steps = [
-        f"**1.** Commission a **bankable solar resource assessment** (P50/P90) from a certified energy assessor using satellite data for {location_name}",
-        f"**2.** Conduct a **grid connection feasibility study** with the local utility — confirm available capacity at {33 if r['system_kwp'] < 1000 else 132} kV",
-        f"**3.** Engage an EPC contractor for a **pre-FEED study** to validate land requirements ({fmt_num(r['land_ha'], 1)} ha) and civil conditions",
-        f"**4.** Initiate **permitting and environmental impact assessment (EIA)** — typical timeline 6–18 months depending on jurisdiction",
-        f"**5.** Develop a **financial model** for lender presentation including P90 generation scenario, debt sizing, and DSCR analysis at {r['wacc']}% WACC",
-    ]
-    for step in steps:
-        st.markdown(f'<p class="bullet">{step}</p>', unsafe_allow_html=True)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+avail_m2_g = 0  # global for use in render
+num_pan_global = 0
+
 if go:
-    if not coord_input:
-        st.error("Please enter a project location.")
-        st.stop()
-    if not connected_power:
-        st.error("Please enter the total connected power.")
-        st.stop()
+    if not coord_input: st.error("Please enter a location."); st.stop()
+    if not connected_power: st.error("Please enter the connected load."); st.stop()
+
+    avail_m2_g = available_area
 
     with st.status("Running SP Optimizer...", expanded=True) as status:
-
-        # Resolve location
         st.write("📍 Resolving location...")
-        coords = parse_coordinates(coord_input)
-        if coords:
-            lat, lon = coords
-            location_name = reverse_geocode(lat, lon)
+        coords = parse_coords(coord_input)
+        if coords: lat,lon=coords; location_name=rev_geocode(lat,lon)
         else:
-            st.write(f"🔍 Geocoding '{coord_input}'...")
-            result = geocode_city(coord_input)
-            if not result:
-                status.update(label="Location not found", state="error")
-                st.error(f"Could not find '{coord_input}'. Try decimal coordinates: 25.2048, 55.2708")
-                st.stop()
-            lat, lon = result
-            location_name = coord_input
+            gc=geocode(coord_input)
+            if not gc:
+                status.update(label="Not found",state="error")
+                st.error(f"Cannot locate '{coord_input}'. Try: 25.2048, 55.2708"); st.stop()
+            lat,lon=gc; location_name=coord_input
         st.write(f"✅ **{location_name}** — {lat:.4f}°N, {lon:.4f}°E")
 
-        # Fetch NASA POWER
-        st.write("🛰️ Fetching climate data from NASA POWER API...")
-        climate = fetch_nasa_power(lat, lon)
+        st.write("🛰️ NASA POWER climate data...")
+        climate=fetch_nasa(lat,lon)
         if "error" in climate:
-            status.update(label="NASA API error", state="error")
-            st.error(f"NASA POWER error: {climate['error']}. Try again shortly.")
-            st.stop()
-        st.write(f"✅ GHI: {climate.get('ghi_daily','—')} kWh/m²/day  ·  Wind @50m: {climate.get('wind_50m','—')} m/s  ·  Temp: {climate.get('temp','—')}°C")
+            status.update(label="NASA error",state="error")
+            st.error(f"NASA POWER error: {climate['error']}"); st.stop()
+        st.write(f"✅ GHI {climate.get('ghi_daily','—')} kWh/m²/day · Wind {climate.get('ws50','—')} m/s · Temp {climate.get('temp','—')}°C · Kt {climate.get('clearness','—')}")
 
-        # Run calculations
-        st.write("⚙️ Running engineering calculations...")
-        ptype = PROJECT_TYPES[project_label]
+        st.write("🌍 PVGIS cross-check (EU JRC)...")
         connected_kw = to_kw(connected_power, power_unit)
+        ptype_cfg_v  = PROJECT_TYPES[project_label]
+        psh_v        = climate.get("psh",5.5)
+        kwp_est      = (connected_kw*ptype_cfg_v["op_h"]/(psh_v*0.78)*oversizing) if psh_v>0 else connected_kw*2
+        pvgis_data   = fetch_pvgis(lat,lon,tilt_angle,az_deg(azimuth),round(kwp_est,1))
+        if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+            st.write(f"✅ PVGIS yield {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr · losses {pvgis_data.get('loss_pct','—')}%")
+        else:
+            st.write("ℹ️ PVGIS not available — using NASA model"); pvgis_data=None
 
-        result = calculate(
-            connected_kw=connected_kw,
-            ptype=ptype,
-            climate=climate,
-            grid_type=grid_type,
-            oversizing_factor=oversizing,
-            tariff_cents=tariff,
-            wacc_pct=wacc,
-            life_yrs=lifetime,
-            degradation_pct=degradation,
-            lat=lat,
-            lon=lon,
+        st.write("⚙️ Engineering calculations...")
+        tariff_aed = custom_tariff/100
+        result=calculate(
+            connected_kw=connected_kw, ptype_cfg=ptype_cfg_v,
+            climate=climate, pvgis_data=pvgis_data,
+            module_choice=module_choice, mounting_choice=mounting_choice,
+            inverter_choice=inverter_choice, grid_type=grid_type,
+            oversizing=oversizing, tilt=tilt_angle, az_label=azimuth,
+            soiling_pct=soiling_loss, albedo_pct=ground_albedo,
+            tariff_aed=tariff_aed, wacc=wacc, life=lifetime,
+            degr=degradation, opex_pct=opex_pct, debt_ratio=debt_ratio,
+            debt_rate=debt_rate, bess_override=bess_override,
+            bess_chem=bess_chem, bess_h_custom=bess_h_custom,
+            include_wind=include_wind, carbon_price_aed=carbon_price,
+            net_metering=net_metering, avail_m2=available_area,
+            setback_pct=setback_pct, lat=lat, lon=lon,
         )
-        st.write("✅ Calculations complete")
-        status.update(label="Report ready ✅", state="complete", expanded=False)
+        num_pan_global = result["num_pan"]
+        st.write("✅ Done")
+        status.update(label="Report ready ✅",state="complete",expanded=False)
 
-    # Show climate data
+    # Climate bar
     st.divider()
     st.subheader(f"📍 {location_name}")
-    st.caption(f"Lat {lat:.4f}°, Lon {lon:.4f}°  ·  Connected load: {connected_power:,.1f} {power_unit}  ·  {project_label}")
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Daily GHI",       f"{climate.get('ghi_daily','—')}", "kWh/m²/day")
-    c2.metric("Annual GHI",      f"{climate.get('ghi_annual','—')}", "kWh/m²/yr")
-    c3.metric("Peak sun hours",  f"{climate.get('psh','—')}", "hrs/day")
-    c4.metric("Wind @ 50m",      f"{climate.get('wind_50m','—')}", "m/s")
-    c5.metric("Avg temperature", f"{climate.get('temp','—')}", "°C")
-    c6.metric("Avg humidity",    f"{climate.get('humidity','—')}", "%")
-    st.markdown('<p class="source-note">NASA POWER Climatology API — 22-year climatological average (2001–2022)</p>', unsafe_allow_html=True)
+    st.caption(f"Lat {lat:.4f}°, Lon {lon:.4f}°  ·  Load: {connected_power:,.1f} {power_unit}  ·  {project_label}  ·  {utility}")
+    c1,c2,c3,c4,c5,c6,c7=st.columns(7)
+    c1.metric("Daily GHI",     f"{climate.get('ghi_daily','—')}","kWh/m²/day")
+    c2.metric("Annual GHI",    f"{climate.get('ghi_annual','—')}","kWh/m²/yr")
+    c3.metric("PSH",           f"{climate.get('psh','—')}","hrs/day")
+    c4.metric("Clearness Kt",  f"{climate.get('clearness','—')}")
+    c5.metric("Wind @ 50m",    f"{climate.get('ws50','—')}","m/s")
+    c6.metric("Avg temp",      f"{climate.get('temp','—')}","°C")
+    c7.metric("Max temp",      f"{climate.get('temp_max','—')}","°C")
+    src="NASA POWER (22-yr avg, 2001–2022)"
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"): src+="  ·  PVGIS 5.2 EU JRC"
+    st.markdown(f'<p class="src">{src}</p>',unsafe_allow_html=True)
 
     st.divider()
-    render(result, climate, location_name, lat, lon, connected_power, power_unit, project_label)
+    render_screen(result,climate,pvgis_data,location_name,lat,lon,
+                  connected_power,power_unit,project_label,utility,mounting_choice)
 
-    # Download
-    full_report = {
-        "project": project_label,
-        "location": location_name,
-        "lat": lat, "lon": lon,
-        "connected_power": f"{connected_power} {power_unit}",
-        "climate_data": climate,
-        "system_results": result,
-    }
+    # PDF download
+    st.divider()
+    with st.spinner("Generating PDF report..."):
+        pdf_buf=generate_pdf(
+            result,climate,pvgis_data,location_name,lat,lon,
+            connected_power,power_unit,project_label,utility,
+            module_choice,mounting_choice,inverter_choice,soiling_loss,
+            tilt_angle,azimuth,ground_albedo,setback_pct,available_area,
+            custom_tariff,wacc,lifetime,degradation,opex_pct,
+            debt_ratio,debt_rate,carbon_price,bess_chem,net_metering)
+
+    fname=f"SP_Optimizer_{location_name.split(',')[0].strip().replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.pdf"
     st.download_button(
-        "⬇ Download full report (JSON)",
-        data=json.dumps(full_report, indent=2, default=str),
-        file_name="sp_optimizer_report.json",
-        mime="application/json",
+        "📄 Download Professional PDF Report",
+        data=pdf_buf,
+        file_name=fname,
+        mime="application/pdf",
+        use_container_width=True,
+        type="primary",
     )
+    st.caption("PDF includes: cover page, area calculations, KPI summary, climate data, technical specs, financial analysis, sustainability metrics, risks & next steps.")
