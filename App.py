@@ -432,7 +432,9 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     if bess_override=="No BESS": bh=0
     elif bess_override=="Force include": bh=bess_h_custom if bess_h_custom>0 else max(def_bh,2)
     else:
-        bh = max(def_bh,48) if grid_type=="Off-grid" else (max(def_bh,4) if grid_type=="Hybrid + BESS" else def_bh)
+        if grid_type=="Off-grid":       bh = max(def_bh, 48)
+        elif grid_type=="Hybrid + BESS":bh = max(def_bh, 4)
+        else:                           bh = 0   # Grid-connected → no BESS
     bess_kwh=bess_kw=bess_cap_aed=0
     if bh>0:
         bess_kwh=connected_kw*bh; bess_kw=connected_kw
@@ -450,8 +452,8 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     total_cap= cap_mod+cap_inv+cap_mnt+cap_bos+cap_epc+cap_con+cap_wnd+bess_cap_aed
     cap_wp   = total_cap/(act_kwp*1000) if act_kwp>0 else 0
     def pct(x): return round(x/total_cap*100,1) if total_cap>0 else 0
-    cb={"Modules":pct(cap_mod),"Inverters":pct(cap_inv),"Mounting & civil":pct(cap_mnt),
-        "BOS & electrical":pct(cap_bos),"EPC / design":pct(cap_epc),
+    cb={"Modules":pct(cap_mod),"Inverters":pct(cap_inv),"Mounting &amp; civil":pct(cap_mnt),
+        "BOS &amp; electrical":pct(cap_bos),"EPC / design":pct(cap_epc),
         "Contingency":pct(cap_con),"BESS":pct(bess_cap_aed),"Wind turbines":pct(cap_wnd)}
 
     # Financials
@@ -810,7 +812,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 3: CLIMATE DATA
     # ══════════════════════════════════════════════════════════════════════════
-    story.append(section_bar("SECTION 3 — CLIMATE & SOLAR RESOURCE DATA"))
+    story.append(section_bar("SECTION 3 — CLIMATE &amp; SOLAR RESOURCE DATA"))
     story.append(Spacer(1, 5))
     src_txt = "NASA POWER Climatology API (2001–2022, 22-year average)"
     if pvgis_data and pvgis_data.get("yield_kwh_yr"):
@@ -861,7 +863,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     panel_tech = module_choice.split(" (")[0]
     tracker_note = mounting_choice.split("—")[0].strip()
     pvgis_src = f"PVGIS JRC: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "NASA POWER model"
-    story.append(kv_tbl("PV MODULE & SOLAR SYSTEM", [
+    story.append(kv_tbl("PV MODULE &amp; SOLAR SYSTEM", [
         ("Module technology",        panel_tech),
         ("Module wattage",           f"{MODULE_SPECS[module_choice]['wp']} Wp"),
         ("Module efficiency",        f"{MODULE_SPECS[module_choice]['eff']*100:.1f}%"),
@@ -883,7 +885,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     ], c55, c45))
     story.append(Spacer(1, 6))
 
-    # Inverter & grid table
+    # Inverter &amp; grid table
     inv_rows_data = [
         ("Inverter type",     inverter_choice.split("(")[0].strip()),
         ("Inverter efficiency",f"{INVERTER_TYPES[inverter_choice]['eff']*100:.1f}%"),
@@ -900,7 +902,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
             ("Cycle life",         "4,000-6,000 cycles (LFP)"),
             ("BESS CAPEX",         aed_s(r['bess_cap_aed'])),
         ]
-    story.append(kv_tbl("INVERTER, GRID & BESS", inv_rows_data, c55, c45))
+    story.append(kv_tbl("INVERTER, GRID &amp; BESS", inv_rows_data, c55, c45))
     story.append(Spacer(1, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -918,7 +920,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         ("Project debt",         aed_s(r['dbt_aed'])),
         ("Debt ratio",           f"{r['debt_ratio']}%"),
         ("Debt interest rate",   f"{r['debt_rate']}%"),
-        ("Annual O&M cost",      aed_s(r['ann_opex'])),
+        ("Annual O&amp;M cost",      aed_s(r['ann_opex'])),
     ]
     story.append(kv_tbl("CAPITAL EXPENDITURE BREAKDOWN", capex_rows, c55, c45))
     story.append(Spacer(1, 6))
@@ -943,7 +945,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 6: SUSTAINABILITY
     # ══════════════════════════════════════════════════════════════════════════
-    story.append(section_bar("SECTION 6 — SUSTAINABILITY & ENVIRONMENTAL IMPACT"))
+    story.append(section_bar("SECTION 6 — SUSTAINABILITY &amp; ENVIRONMENTAL IMPACT"))
     story.append(Spacer(1, 5))
     story.append(kv_tbl("ENVIRONMENTAL METRICS", [
         ("CO2 avoided per year",            f"{fmt(r['co2_yr'],1)} tonnes/yr"),
@@ -951,20 +953,20 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         ("UAE households powered / year",   fmt(r['hh'])),
         ("Carbon credit value",             f"{aed_s(r['co2_rev'])}/yr"),
         ("Grid emission factor",            "0.341 kgCO2/kWh  (DEWA Clean Energy Report 2023)"),
-        ("UAE Net Zero alignment",          "Supports UAE 2050 Net Zero & 44% clean energy target"),
+        ("UAE Net Zero alignment",          "Supports UAE 2050 Net Zero &amp; 44% clean energy target"),
         ("SDG alignment",                   "SDG 7 (Clean Energy), SDG 11 (Sustainable Cities), SDG 13 (Climate Action)"),
     ], c55, c45))
     story.append(Spacer(1, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 7: RISKS & NEXT STEPS
+    # SECTION 7: RISKS &amp; NEXT STEPS
     # ══════════════════════════════════════════════════════════════════════════
-    story.append(section_bar("SECTION 7 — KEY RISKS & MITIGATIONS"))
+    story.append(section_bar("SECTION 7 — KEY RISKS &amp; MITIGATIONS"))
     story.append(Spacer(1, 5))
 
     risk_data = [
         ["Risk",                                            "Mitigation"],
-        ["Soiling & dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
+        ["Soiling &amp; dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
         [f"High cell temperature ({r['cell_temp']}C avg operating)", "Specify TOPCon/HJT modules with temp. coeff. below -0.30%/C"],
         ["Grid curtailment by DEWA/SEWA",                  "Include active power control in inverter spec; evaluate BESS for peak shifting"],
         ["Tariff / regulatory change",                     "Lock in net metering agreement or long-term PPA before financial close"],
@@ -979,7 +981,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     story.append(Spacer(1, 6))
     util_short = utility.split("(")[0].strip()
     steps = [
-        f"Submit interconnection / net metering application to {util_short} (Shams Dubai portal for DEWA projects)",
+        f"Submit interconnection / net metering application to {util_short} — " + ("Shams Dubai portal (shams.dewa.gov.ae)" if "DEWA" in utility else "SEWA online portal (sewa.gov.ae)" if "SEWA" in utility else "FEWA customer portal" if "FEWA" in utility else "ADDC/AADC customer portal" if "ADDC" in utility else "local utility customer portal"),
         f"Commission bankable P50/P90 energy yield assessment for {location_name} — required for project financing at {aed_s(r['total_cap'])} scale",
         f"Appoint DEWA/Trakhees-approved EPC contractor and obtain No Objection Certificate (NOC) from relevant authority",
         f"Confirm site land availability: minimum {fmt(r['site_m2'],0)} m2 ({fmt(r['site_ha'],2)} ha) required for this system",
@@ -1143,7 +1145,12 @@ if go:
     with st.status("Running SP Optimizer...", expanded=True) as status:
         st.write("📍 Resolving location...")
         coords = parse_coords(coord_input)
-        if coords: lat,lon=coords; location_name=rev_geocode(lat,lon)
+        if coords:
+            lat,lon=coords
+            location_name=rev_geocode(lat,lon)
+            # If rev_geocode just returned coordinates, label it nicely
+            if location_name.replace(".","").replace(",","").replace("-","").replace(" ","").isdigit() or (location_name.count(",")==1 and all(c in "0123456789.,- " for c in location_name)):
+                location_name=f"Site ({lat:.4f}N, {lon:.4f}E)"
         else:
             gc=geocode(coord_input)
             if not gc:
