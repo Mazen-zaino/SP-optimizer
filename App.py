@@ -63,14 +63,30 @@ PROJECT_TYPES = {
 with st.sidebar:
     st.markdown("### ⚡ SP Optimizer")
     st.markdown("---")
+
+    # Try secrets first (for the app owner), otherwise ask the user
     api_key = ""
     try:
         api_key = st.secrets["ANTHROPIC_API_KEY"]
         st.success("API key loaded ✅")
     except Exception:
-        api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
-        if not api_key:
-            st.info("Enter your API key or add it to `.streamlit/secrets.toml`")
+        st.markdown("**🔑 Anthropic API Key**")
+        api_key = st.text_input(
+            "API Key",
+            type="password",
+            placeholder="sk-ant-...",
+            label_visibility="collapsed",
+            help="Your key is never stored — it is only used for this session."
+        )
+        if api_key:
+            st.success("Key entered ✅")
+        else:
+            st.info(
+                "Enter your Anthropic API key to generate reports.\n\n"
+                "Get a free key at [console.anthropic.com](https://console.anthropic.com) — "
+                "costs only a few cents per report."
+            )
+
     st.markdown("---")
     st.markdown("""
 **Auto-fetched from NASA POWER:**
@@ -389,7 +405,12 @@ def render(d, climate, location_name, lat, lon, connected_power, power_unit):
 # ── Main execution ────────────────────────────────────────────────────────────
 if go:
     if not api_key:
-        st.error("Please enter your Anthropic API key in the sidebar.")
+        st.warning(
+            "**API key required to generate reports.**\n\n"
+            "Enter your Anthropic API key in the sidebar on the left. "
+            "Get one free at [console.anthropic.com](https://console.anthropic.com) — "
+            "costs a few cents per report, billed to your own account."
+        )
         st.stop()
     if not coord_input:
         st.error("Please enter a location.")
