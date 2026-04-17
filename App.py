@@ -240,28 +240,66 @@ def rev_geocode(lat,lon):
         return ", ".join(parts[:3]) if parts else f"{lat:.3f},{lon:.3f}"
     except: return f"{lat:.4f},{lon:.4f}"
 
-def fetch_nasa(lat,lon):
-    params="ALLSKY_SFC_SW_DWN,CLRSKY_SFC_SW_DWN,WS50M,WS80M,WS10M,T2M,T2M_MAX,T2M_MIN,PRECTOTCORR,RH2M,ALLSKY_KT"
-    url=(f"https://power.larc.nasa.gov/api/temporal/climatology/point"
-         f"?parameters={params}&community=RE&longitude={lon}&latitude={lat}&format=JSON")
-    try:
-        r=requests.get(url,timeout=35); r.raise_for_status()
-        p=r.json()["properties"]["parameter"]
-        def g(k): return p.get(k,{}).get("ANN")
-        ghi_d=g("ALLSKY_SFC_SW_DWN"); kt=g("ALLSKY_KT")
-        return {"ghi_daily":round(ghi_d,3) if ghi_d else None,
-                "ghi_annual":int(ghi_d*365) if ghi_d else None,
-                "psh":round(ghi_d,3) if ghi_d else None,
-                "clear_sky":round(g("CLRSKY_SFC_SW_DWN"),2) if g("CLRSKY_SFC_SW_DWN") else None,
-                "clearness":round(kt,3) if kt else None,
-                "ws50":round(g("WS50M"),2) if g("WS50M") else None,
-                "ws80":round(g("WS80M"),2) if g("WS80M") else None,
-                "temp":round(g("T2M"),1) if g("T2M") else None,
-                "temp_max":round(g("T2M_MAX"),1) if g("T2M_MAX") else None,
-                "temp_min":round(g("T2M_MIN"),1) if g("T2M_MIN") else None,
-                "humidity":round(g("RH2M"),1) if g("RH2M") else None,
-                "source":"NASA POWER Climatology API (2001–2022)"}
-    except Exception as e: return {"error":str(e)}
+def fetch_nasa(lat, lon):
+    """
+    Fetch NASA POWER climatology data in two small requests to avoid 422 errors.
+    NASA POWER RE community supports max ~8 parameters per call reliably.
+    WS80M is excluded — not available in RE community for all regions.
+    """
+    base = (f"https://power.larc.nasa.gov/api/temporal/climatology/point"
+            f"?community=RE&longitude={lon:.6f}&latitude={lat:.6f}&format=JSON")
+
+    # Request 1 — solar parameters
+    solar_params = "ALLSKY_SFC_SW_DWN,CLRSKY_SFC_SW_DWN,ALLSKY_KT,T2M,T2M_MAX,T2M_MIN"
+    # Request 2 — wind + humidity
+    wind_params  = "WS50M,WS10M,RH2M,PRECTOTCORR"
+
+    p = {}
+    for params in [solar_params, wind_params]:
+        try:
+            r = requests.get(f"{base}&parameters={params}", timeout=35)
+            if r.status_code == 200:
+                p.update(r.json().get("properties", {}).get("parameter", {}))
+            else:
+                # Try each param individually if batch fails
+                for param in params.split(","):
+                    try:
+                        r2 = requests.get(f"{base}&parameters={param}", timeout=20)
+                        if r2.status_code == 200:
+                            p.update(r2.json().get("properties", {}).get("parameter", {}))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if not p:
+        return {"error": "NASA POWER returned no data. Please try again in a moment."}
+
+    def g(k):
+        return p.get(k, {}).get("ANN")
+
+    ghi_d = g("ALLSKY_SFC_SW_DWN")
+    kt    = g("ALLSKY_KT")
+    ws50  = g("WS50M")
+    ws10  = g("WS10M")
+    # Estimate ws80 from ws50 using wind shear power law (α=0.14 for open terrain)
+    ws80  = round(ws50 * (80/50)**0.14, 2) if ws50 else None
+
+    return {
+        "ghi_daily":   round(ghi_d, 3) if ghi_d else None,
+        "ghi_annual":  int(ghi_d * 365) if ghi_d else None,
+        "psh":         round(ghi_d, 3) if ghi_d else None,
+        "clear_sky":   round(g("CLRSKY_SFC_SW_DWN"), 2) if g("CLRSKY_SFC_SW_DWN") else None,
+        "clearness":   round(kt, 3) if kt else None,
+        "ws50":        round(ws50, 2) if ws50 else None,
+        "ws80":        ws80,
+        "ws10":        round(ws10, 2) if ws10 else None,
+        "temp":        round(g("T2M"), 1) if g("T2M") else None,
+        "temp_max":    round(g("T2M_MAX"), 1) if g("T2M_MAX") else None,
+        "temp_min":    round(g("T2M_MIN"), 1) if g("T2M_MIN") else None,
+        "humidity":    round(g("RH2M"), 1) if g("RH2M") else None,
+        "source":      "NASA POWER Climatology API (2001–2022)",
+    }
 
 def fetch_pvgis(lat,lon,tilt,az_deg,kwp):
     try:
