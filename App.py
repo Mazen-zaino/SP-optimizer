@@ -536,6 +536,19 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
 
     buf = io.BytesIO()
 
+    # Register DejaVu fonts for full Unicode / Arabic support
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    try:
+        pdfmetrics.registerFont(TTFont('DejaVu',     '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+        pdfmetrics.registerFont(TTFont('DejaVuBold', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
+        BODY_FONT  = 'DejaVu'
+        BOLD_FONT  = 'DejaVuBold'
+    except Exception:
+        BODY_FONT  = 'Helvetica'
+        BOLD_FONT  = 'Helvetica-Bold'
+
+
     # Page width: A4 = 595pt, margins 2cm each side (56.7pt each) → usable = ~481pt
     PAGE_W = A4[0]
     L_MARGIN = R_MARGIN = 2 * cm
@@ -562,15 +575,15 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     def ps(nm, **kw):
         return ParagraphStyle(nm, parent=ss["Normal"], **kw)
 
-    S_title  = ps("Tt", fontSize=18, fontName="Helvetica-Bold", textColor=WHITE, leading=22)
-    S_sub    = ps("Sb", fontSize=10, fontName="Helvetica",      textColor=WHITE, leading=14)
-    S_h2     = ps("H2", fontSize=11, fontName="Helvetica-Bold", textColor=G_DARK, spaceAfter=3)
-    S_body   = ps("Bd", fontSize=9,  fontName="Helvetica",      textColor=BLACK,  leading=13)
-    S_lbl    = ps("Lb", fontSize=8.5,fontName="Helvetica",      textColor=GRAY6)
-    S_val    = ps("Vl", fontSize=8.5,fontName="Helvetica-Bold", textColor=BLACK,  alignment=TA_RIGHT)
+    S_title  = ps("Tt", fontSize=18, fontName=BOLD_FONT, textColor=WHITE, leading=22)
+    S_sub    = ps("Sb", fontSize=10, fontName=BODY_FONT,      textColor=WHITE, leading=14)
+    S_h2     = ps("H2", fontSize=11, fontName=BOLD_FONT, textColor=G_DARK, spaceAfter=3)
+    S_body   = ps("Bd", fontSize=9,  fontName=BODY_FONT,      textColor=BLACK,  leading=13)
+    S_lbl    = ps("Lb", fontSize=8.5,fontName=BODY_FONT,      textColor=GRAY6)
+    S_val    = ps("Vl", fontSize=8.5,fontName=BOLD_FONT, textColor=BLACK,  alignment=TA_RIGHT)
     S_note   = ps("Nt", fontSize=7.5,fontName="Helvetica-Oblique", textColor=colors.HexColor("#888888"), leading=11)
     S_footer = ps("Ft", fontSize=7,  fontName="Helvetica-Oblique", textColor=colors.HexColor("#aaaaaa"))
-    S_white  = ps("Wh", fontSize=8.5,fontName="Helvetica-Bold", textColor=WHITE,  alignment=TA_CENTER)
+    S_white  = ps("Wh", fontSize=8.5,fontName=BOLD_FONT, textColor=WHITE,  alignment=TA_CENTER)
 
     now = datetime.now().strftime("%d %B %Y")
 
@@ -580,9 +593,9 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         return TableStyle([
             ("BACKGROUND",  (0,0),(-1,0), G_DARK),
             ("TEXTCOLOR",   (0,0),(-1,0), WHITE),
-            ("FONTNAME",    (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTNAME",    (0,0),(-1,0), BOLD_FONT),
             ("FONTSIZE",    (0,0),(-1,0), 8.5),
-            ("FONTNAME",    (0,1),(-1,-1),"Helvetica"),
+            ("FONTNAME",    (0,1),(-1,-1),BODY_FONT),
             ("FONTSIZE",    (0,1),(-1,-1), 8.5),
             ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, GR_LT]),
             ("GRID",        (0,0),(-1,-1), 0.3, GR_MD),
@@ -598,13 +611,13 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         return TableStyle([
             ("BACKGROUND",  (0,0),(-1,0), G_MID),
             ("TEXTCOLOR",   (0,0),(-1,0), WHITE),
-            ("FONTNAME",    (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTNAME",    (0,0),(-1,0), BOLD_FONT),
             ("FONTSIZE",    (0,0),(-1,0), 8.5),
             ("SPAN",        (0,0),(-1,0)),
             ("ALIGN",       (0,0),(-1,0),"CENTER"),
-            ("FONTNAME",    (0,1),(-1,-1),"Helvetica"),
+            ("FONTNAME",    (0,1),(-1,-1),BODY_FONT),
             ("FONTSIZE",    (0,1),(-1,-1), 8.5),
-            ("FONTNAME",    (1,1),(1,-1),  "Helvetica-Bold"),
+            ("FONTNAME",    (1,1),(1,-1),  BOLD_FONT),
             ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, GR_LT]),
             ("GRID",        (0,0),(-1,-1), 0.3, GR_MD),
             ("TOPPADDING",  (0,0),(-1,-1), 4),
@@ -626,7 +639,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
 
     def section_bar(title):
         """Full-width dark green section divider bar."""
-        t = Table([[Paragraph(title, ps("SB2", fontSize=10, fontName="Helvetica-Bold",
+        t = Table([[Paragraph(title, ps("SB2", fontSize=10, fontName=BOLD_FONT,
                                         textColor=WHITE))]],
                   colWidths=[W])
         t.setStyle(TableStyle([
@@ -677,7 +690,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     badge_col = {"solar": G_MID, "wind": colors.HexColor("#185FA5"),
                  "hybrid": colors.HexColor("#534AB7")}.get(r["badge"], G_MID)
     rec_tbl = Table([[Paragraph(f"Recommended system: {r['source']}",
-                                ps("RC", fontSize=11, fontName="Helvetica-Bold", textColor=WHITE))]],
+                                ps("RC", fontSize=11, fontName=BOLD_FONT, textColor=WHITE))]],
                     colWidths=[W])
     rec_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0,0),(-1,-1), badge_col),
@@ -708,15 +721,15 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # Big area highlight row — 5 equal columns
     col5 = W / 5
     area_highlight = Table(
-        [[Paragraph(f"{fmt(r['panel_m2'],0)} m²",   ps("AV1",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
-          Paragraph(f"{fmt(r['array_m2'],0)} m²",   ps("AV2",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
-          Paragraph(f"{fmt(r['site_m2'],0)} m²",    ps("AV3",fontSize=18,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
-          Paragraph(f"{fmt(r['site_ha'],3)} ha",     ps("AV4",fontSize=16,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
-          Paragraph(f"{fmt(r['site_m2_kwp'],1)} m²/kWp",ps("AV5",fontSize=14,fontName="Helvetica-Bold",textColor=WHITE,alignment=TA_CENTER)),
+        [[Paragraph(f"{fmt(r['panel_m2'],0)} m²",   ps("AV1",fontSize=16,fontName=BOLD_FONT,textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['array_m2'],0)} m²",   ps("AV2",fontSize=16,fontName=BOLD_FONT,textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_m2'],0)} m²",    ps("AV3",fontSize=18,fontName=BOLD_FONT,textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_ha'],3)} ha",     ps("AV4",fontSize=16,fontName=BOLD_FONT,textColor=WHITE,alignment=TA_CENTER)),
+          Paragraph(f"{fmt(r['site_m2_kwp'],1)} m²/kWp",ps("AV5",fontSize=14,fontName=BOLD_FONT,textColor=WHITE,alignment=TA_CENTER)),
          ],
          [Paragraph("Panel active area",   ps("AL1",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
           Paragraph("Array footprint",     ps("AL2",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
-          Paragraph("TOTAL SITE REQUIRED", ps("AL3",fontSize=7.5,fontName="Helvetica-Bold",textColor=AMBER,alignment=TA_CENTER)),
+          Paragraph("TOTAL SITE REQUIRED", ps("AL3",fontSize=7.5,fontName=BOLD_FONT,textColor=AMBER,alignment=TA_CENTER)),
           Paragraph("In hectares",         ps("AL4",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
           Paragraph("Area per kWp",        ps("AL5",fontSize=7.5,textColor=G_LIGHT,alignment=TA_CENTER)),
          ]],
@@ -756,9 +769,9 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # Highlight the "TOTAL SITE AREA" row (row index 6)
     at.setStyle(TableStyle(list(ts_header()._cmds) + [
         ("BACKGROUND",  (0,6),(-1,6), G_PALE),
-        ("FONTNAME",    (0,6),(-1,6), "Helvetica-Bold"),
+        ("FONTNAME",    (0,6),(-1,6), BOLD_FONT),
         ("BACKGROUND",  (0,7),(-1,7), G_PALE),
-        ("FONTNAME",    (0,7),(-1,7), "Helvetica-Bold"),
+        ("FONTNAME",    (0,7),(-1,7), BOLD_FONT),
     ]))
     story.append(at)
     story.append(Spacer(1, 4))
@@ -791,12 +804,12 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     kpi_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
         ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
-        ("FONTNAME",      (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
         ("FONTSIZE",      (0,0),(-1,0),  8.5),
-        ("FONTNAME",      (0,1),(-1,-1), "Helvetica"),
+        ("FONTNAME",      (0,1),(-1,-1), BODY_FONT),
         ("FONTSIZE",      (0,1),(-1,-1), 8.5),
-        ("FONTNAME",      (1,1),(1,-1),  "Helvetica-Bold"),
-        ("FONTNAME",      (3,1),(3,-1),  "Helvetica-Bold"),
+        ("FONTNAME",      (1,1),(1,-1),  BOLD_FONT),
+        ("FONTNAME",      (3,1),(3,-1),  BOLD_FONT),
         ("BACKGROUND",    (2,1),(-1,-1), GR_LT),
         ("ROWBACKGROUNDS",(0,1),(1,-1),  [WHITE, colors.HexColor("#F5FBF8")]),
         ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
@@ -835,11 +848,11 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     clim_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
         ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
-        ("FONTNAME",      (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
         ("FONTSIZE",      (0,0),(-1,-1), 8.5),
-        ("FONTNAME",      (0,1),(-1,-1), "Helvetica"),
-        ("FONTNAME",      (1,1),(1,-1),  "Helvetica-Bold"),
-        ("FONTNAME",      (3,1),(3,-1),  "Helvetica-Bold"),
+        ("FONTNAME",      (0,1),(-1,-1), BODY_FONT),
+        ("FONTNAME",      (1,1),(1,-1),  BOLD_FONT),
+        ("FONTNAME",      (3,1),(3,-1),  BOLD_FONT),
         ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
         ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
         ("TOPPADDING",    (0,0),(-1,-1), 4),
@@ -966,7 +979,7 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
 
     risk_data = [
         ["Risk",                                            "Mitigation"],
-        ["Soiling &amp; dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
+        ["Soiling & dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
         [f"High cell temperature ({r['cell_temp']}C avg operating)", "Specify TOPCon/HJT modules with temp. coeff. below -0.30%/C"],
         ["Grid curtailment by DEWA/SEWA",                  "Include active power control in inverter spec; evaluate BESS for peak shifting"],
         ["Tariff / regulatory change",                     "Lock in net metering agreement or long-term PPA before financial close"],
