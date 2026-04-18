@@ -515,12 +515,10 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     # NASA-based yield (always calculated — used as fallback and in area mode)
     ann_solar_nasa = act_kwp * psh * 365 * pr
 
-    # PVGIS yield: ONLY use in load-constrained mode because PVGIS was fetched
-    # with the load-based kwp_est BEFORE calculate() ran. In area mode the
-    # act_kwp is different (smaller), making the PVGIS value incorrect.
+    # PVGIS is now always fetched with the correct act_kwp (calculate runs first,
+    # then PVGIS is fetched, then calculate re-runs). Safe to use in both modes.
     pvgis_used = False
-    if area_mode == "load" and pvgis_data and pvgis_data.get("yield_kwh_yr"):
-        # PVGIS returns total yield for the system; use directly
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
         ann_solar  = pvgis_data["yield_kwh_yr"]
         pvgis_used = True
     else:
@@ -1306,11 +1304,10 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # PV module table
     panel_tech = module_choice.split(" (")[0]
     tracker_note = mounting_choice.split("—")[0].strip()
-    if r["area_mode"] == "area":
-        pvgis_src = ("NASA POWER model (area-constrained: PVGIS not applied — "
-                     "would require re-fetch with actual system size)")
-    elif pvgis_data and pvgis_data.get("yield_kwh_yr"):
+    if pvgis_data and pvgis_data.get("yield_kwh_yr") and r["pvgis_used"]:
         pvgis_src = f"PVGIS JRC: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr"
+    elif pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        pvgis_src = f"NASA POWER model (PVGIS cross-check: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr)"
     else:
         pvgis_src = "NASA POWER model"
     story.append(kv_tbl("PV MODULE &amp; SOLAR SYSTEM", [
