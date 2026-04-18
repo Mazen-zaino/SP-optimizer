@@ -407,7 +407,13 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
               tariff_aed, wacc, life, degr, opex_pct, debt_ratio, debt_rate,
               bess_override, bess_chem, bess_h_custom, include_wind,
               carbon_price_aed, net_metering, avail_m2, setback_pct, lat, lon):
-
+    """
+    Dual-mode calculator:
+    MODE A — Load-constrained (avail_m2 = 0):
+        Size system to cover the connected load → calculate area needed.
+    MODE B — Area-constrained (avail_m2 > 0):
+        Size system to fit the available area → calculate load coverage %.
+    """
     mod = MODULE_SPECS[module_choice]
     mnt = MOUNTING_TYPES[mounting_choice]
     inv_eff = INVERTER_TYPES[inverter_choice]["eff"]
@@ -419,57 +425,91 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     tmax  = climate.get("temp_max", 42.0)
     ws50  = climate.get("ws50", 4.5)
 
-    # Temperature
-    cell_temp   = temp + 25
-    temp_dera   = 1 + mod["temp_coef"] * (cell_temp - 25)
-    temp_dera   = max(0.75, min(1.02, temp_dera))
-
-    # Bifacial
-    bifacial_g  = mod.get("bifacial_gain",0)*( albedo_pct/20) if mod.get("bifacial") else 0
-
-    # Azimuth derate
+    # ── Performance ratio (common to both modes) ───────────────────────────
+    cell_temp  = temp + 25
+    temp_dera  = 1 + mod["temp_coef"] * (cell_temp - 25)
+    temp_dera  = max(0.75, min(1.02, temp_dera))
+    bifacial_g = mod.get("bifacial_gain", 0) * (albedo_pct / 20) if mod.get("bifacial") else 0
     az_d = {"South (optimal)":1.00,"South-East":0.95,"South-West":0.95,"East-West (split)":0.89}.get(az_label,1.0)
-
-    # PR
     pr = (temp_dera * (1-soiling_pct/100) * inv_eff * 0.980 * 0.980 *
           az_d * TRACKER_BOOST.get(mounting_choice,1.0) * (1+bifacial_g))
-    pr = round(max(0.60,min(1.05,pr)), 3)
+    pr = round(max(0.60, min(1.05, pr)), 3)
 
-    # Source
-    sol_score = psh/6.0; wnd_score = ws50/8.0
-    if include_wind and wnd_score>=0.75 and sol_score>=0.70:
-        source="Solar PV + Wind Hybrid"; badge="hybrid"; sf=0.70; wf=0.30
-    elif include_wind and wnd_score>sol_score*1.2 and wnd_score>=0.75:
-        source="Onshore Wind"; badge="wind"; sf=0.0; wf=1.0
+    # ── Source recommendation (common to both modes) ───────────────────────
+    sol_score = psh / 6.0; wnd_score = ws50 / 8.0
+    if include_wind and wnd_score >= 0.75 and sol_score >= 0.70:
+        source = "Solar PV + Wind Hybrid"; badge = "hybrid"; sf = 0.70; wf = 0.30
+    elif include_wind and wnd_score > sol_score * 1.2 and wnd_score >= 0.75:
+        source = "Onshore Wind"; badge = "wind"; sf = 0.0; wf = 1.0
     else:
-        source="Solar PV"; badge="solar"; sf=1.0; wf=0.0
+        source = "Solar PV"; badge = "solar"; sf = 1.0; wf = 0.0
 
-    # Sizing
+    # ── Demand ─────────────────────────────────────────────────────────────
     daily_kwh = connected_kw * op_h
     ann_dem   = daily_kwh * 365
-    min_kwp   = (daily_kwh/(psh*pr)) if psh>0 else connected_kw*1.5
-    sys_kwp   = min_kwp * oversizing * sf
-    wind_kw   = min_kwp * oversizing * wf if wf>0 else 0
 
-    # Panels & area
-    num_pan   = math.ceil((sys_kwp*1000)/mod["wp"]) if sys_kwp>0 else 0
-    act_kwp   = (num_pan*mod["wp"])/1000
-    m2_per_panel = mod["wp"]/1000/mod["eff"]      # m² per panel
-    panel_m2  = num_pan * m2_per_panel             # pure panel area
-    gcr       = mnt["gcr"]
-    array_m2  = panel_m2/gcr if gcr>0 else panel_m2  # array footprint
-    usable_f  = (1-setback_pct/100)/mnt["land_buffer"]
-    site_m2   = array_m2/usable_f if usable_f>0 else array_m2*mnt["land_buffer"]*(1+setback_pct/100)
-    site_ha   = site_m2/10000
-    site_m2_kwp = site_m2/act_kwp if act_kwp>0 else 0
-    arr_m2_kwp  = array_m2/act_kwp if act_kwp>0 else 0
+    # ── Geometry constants ─────────────────────────────────────────────────
+    gcr          = mnt["gcr"]
+    m2_per_panel = mod["wp"] / 1000 / mod["eff"]   # m² per panel at STC
+    usable_f     = (1 - setback_pct/100) / mnt["land_buffer"]  # usable fraction of site
 
-    # Available area check
-    area_ok = True; max_kwp_area = None
-    if avail_m2 and avail_m2>0:
-        usable_avail = avail_m2*(1-setback_pct/100)/mnt["land_buffer"]
-        max_kwp_area = usable_avail*gcr*mod["eff"]   # kWp = m² × gcr × efficiency (kWp/m²)
-        if max_kwp_area < act_kwp*0.95: area_ok=False
+    # ═══════════════════════════════════════════════════════════════════════
+    # MODE B — Area-constrained: derive system from available space
+    # ═══════════════════════════════════════════════════════════════════════
+    area_mode = "area" if (avail_m2 and avail_m2 > 0) else "load"
+
+    if area_mode == "area":
+        # Step 1: work out usable panel area from the site footprint
+        usable_site_m2  = avail_m2 * (1 - setback_pct/100)        # remove setbacks
+        array_m2_fit    = usable_site_m2 / mnt["land_buffer"]      # remove land buffer
+        panel_m2_fit    = array_m2_fit * gcr                       # panel area within array
+
+        # Step 2: max panels and DC capacity that fit
+        num_pan_max = int(panel_m2_fit / m2_per_panel)             # floor — no partial panels
+        num_pan_max = max(1, num_pan_max)
+        act_kwp_max = (num_pan_max * mod["wp"]) / 1000             # kWp solar
+
+        # Step 3: apply solar fraction for hybrid
+        act_kwp = act_kwp_max * sf if sf > 0 else act_kwp_max
+        num_pan = math.ceil(act_kwp * 1000 / mod["wp"]) if act_kwp > 0 else 0
+        act_kwp = (num_pan * mod["wp"]) / 1000
+
+        # Step 4: wind capacity proportional to solar (hybrid only)
+        wind_kw = act_kwp_max * wf if wf > 0 else 0
+
+        # Step 5: actual areas for this system
+        panel_m2 = num_pan * m2_per_panel
+        array_m2 = panel_m2 / gcr if gcr > 0 else panel_m2
+        site_m2  = avail_m2   # constrained — system designed to fit this
+        site_ha  = site_m2 / 10000
+        area_ok  = True        # system is sized TO FIT, always OK
+        max_kwp_area = act_kwp_max   # document what fits
+
+        # What load capacity this covers
+        load_kwp_needed = (daily_kwh / (psh * pr)) * sf if psh > 0 else connected_kw
+        load_covered_pct = min(100.0, act_kwp / load_kwp_needed * 100) if load_kwp_needed > 0 else 100.0
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MODE A — Load-constrained: derive system from demand
+    # ═══════════════════════════════════════════════════════════════════════
+    else:
+        min_kwp = (daily_kwh / (psh * pr)) if psh > 0 else connected_kw * 1.5
+        sys_kwp = min_kwp * oversizing * sf
+        wind_kw = min_kwp * oversizing * wf if wf > 0 else 0
+
+        num_pan  = math.ceil((sys_kwp * 1000) / mod["wp"]) if sys_kwp > 0 else 0
+        act_kwp  = (num_pan * mod["wp"]) / 1000
+        panel_m2 = num_pan * m2_per_panel
+        array_m2 = panel_m2 / gcr if gcr > 0 else panel_m2
+        site_m2  = array_m2 / usable_f if usable_f > 0 else array_m2 * mnt["land_buffer"]
+        site_ha  = site_m2 / 10000
+        area_ok  = True
+        max_kwp_area = None
+        load_covered_pct = min(100.0, act_kwp / (sys_kwp if sys_kwp > 0 else act_kwp) * 100)
+
+    # ── Common area metrics ────────────────────────────────────────────────
+    site_m2_kwp = site_m2 / act_kwp if act_kwp > 0 else 0
+    arr_m2_kwp  = array_m2 / act_kwp if act_kwp > 0 else 0
 
     # Generation
     ann_solar = act_kwp*psh*365*pr
@@ -572,7 +612,8 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         gcr=gcr,array_m2=round(array_m2,1),
         site_m2=round(site_m2,1),site_ha=round(site_ha,3),
         site_m2_kwp=round(site_m2_kwp,1),arr_m2_kwp=round(arr_m2_kwp,1),
-        area_ok=area_ok,max_kwp_area=max_kwp_area,
+        area_mode=area_mode,area_ok=area_ok,max_kwp_area=max_kwp_area,
+        load_covered_pct=round(load_covered_pct,1),
         pr=round(pr*100,1),cell_temp=round(cell_temp,1),
         temp_dera=round((1-temp_dera)*100,2),bifacial_g=round(bifacial_g*100,1),
         ann_gen=round(ann_gen,0),ann_gen_mwh=round(ann_gen/1000,1),
@@ -975,22 +1016,37 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     story.append(Spacer(1, 6))
 
     # Area breakdown table
+    if r["area_mode"] == "area":
+        area_title_row = ["AREA-CONSTRAINED DESIGN — system sized to fit available space","",""]
+        avail_note = f"Input: {fmt(avail_m2,0)} m²"
+    else:
+        area_title_row = ["LOAD-CONSTRAINED DESIGN — area calculated to cover full load","",""]
+        avail_note = "Calculated from load demand"
+
     area_rows = [
         ["Parameter", "Value", "Explanation"],
-        ["PV module active area",        f"{fmt(r['panel_m2'],1)} m²",   f"{fmt(r['num_pan'])} panels x {round(r['panel_m2']/r['num_pan'] if r['num_pan'] else 0,2)} m² each"],
-        ["Ground cover ratio (GCR)",     f"{r['gcr']}",                  f"{int(r['gcr']*100)}% of ground covered by panels — {mounting_choice.split('—')[0].strip()}"],
-        ["Array footprint (panel/GCR)",  f"{fmt(r['array_m2'],1)} m²",   "Minimum ground area for the panel array"],
-        ["Land buffer factor",           f"{MOUNTING_TYPES[mounting_choice]['land_buffer']}x", "Roads, inverter pads, fencing, fire clearance"],
-        ["Site setback / unusable",      f"{setback_pct}%",              "Excluded from usable site area"],
-        ["TOTAL SITE AREA REQUIRED",     f"{fmt(r['site_m2'],0)} m²",    "Minimum land area needed to install the system"],
-        ["In hectares",                  f"{fmt(r['site_ha'],3)} ha",     "1 hectare = 10,000 m²"],
-        ["Array area per kWp",           f"{fmt(r['arr_m2_kwp'],1)} m²/kWp", "Array footprint per kWp of installed capacity"],
-        ["Total site per kWp",           f"{fmt(r['site_m2_kwp'],1)} m²/kWp","Total site per kWp installed"],
+        [area_title_row[0], "", ""],
+        ["Calculation mode",             "Area → System" if r["area_mode"]=="area" else "Load → Area",
+                                         avail_note],
+        ["PV module active area",        f"{fmt(r['panel_m2'],1)} m²",
+                                         f"{fmt(r['num_pan'])} panels x {round(r['panel_m2']/r['num_pan'] if r['num_pan'] else 0,2)} m² each"],
+        ["Ground cover ratio (GCR)",     f"{r['gcr']}",
+                                         f"{int(r['gcr']*100)}% of ground covered — {mounting_choice.split('—')[0].strip()}"],
+        ["Array footprint (panel/GCR)",  f"{fmt(r['array_m2'],1)} m²",  "Minimum ground area for the panel array"],
+        ["Land buffer factor",           f"{MOUNTING_TYPES[mounting_choice]['land_buffer']}x",
+                                         "Roads, inverter pads, fencing, fire clearance"],
+        ["Site setback / unusable",      f"{setback_pct}%",             "Excluded from usable site area"],
+        ["TOTAL SITE AREA",              f"{fmt(r['site_m2'],0)} m²",
+                                         "Available site" if r["area_mode"]=="area" else "Required to cover full load"],
+        ["In hectares",                  f"{fmt(r['site_ha'],3)} ha",    "1 hectare = 10,000 m²"],
+        ["Array area per kWp",           f"{fmt(r['arr_m2_kwp'],1)} m²/kWp", "Array footprint per kWp installed"],
+        ["Total site per kWp",           f"{fmt(r['site_m2_kwp'],1)} m²/kWp", "Total site per kWp installed"],
+        ["LOAD COVERAGE",                f"{r['load_covered_pct']}%",
+                                         "Full load covered" if r['load_covered_pct']>=95 else f"{round(100-r['load_covered_pct'],1)}% from grid / other source"],
     ]
-    if avail_m2 and avail_m2 > 0:
-        feasible = "SUFFICIENT — system fits" if r["area_ok"] else f"INSUFFICIENT — max {fmt(r['max_kwp_area'],0)} kWp fits"
-        area_rows.append(["Available area (entered)",  f"{fmt(avail_m2,0)} m²", "Provided by user"])
-        area_rows.append(["Area feasibility check",    feasible,                "Based on GCR and setbacks"])
+    if avail_m2 and avail_m2 > 0 and r["area_mode"]=="area" and r["max_kwp_area"]:
+        area_rows.append(["Max solar capacity in area",  f"{fmt(r['max_kwp_area'],0)} kWp",
+                           "Based on GCR and setbacks"])
 
     at = Table(area_rows, colWidths=[W*0.38, W*0.22, W*0.40])
     at.setStyle(ts_header())
@@ -1003,10 +1059,13 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     ]))
     story.append(at)
     story.append(Spacer(1, 4))
+    mode_txt = ("Area-constrained mode: system sized to fit available space" if r["area_mode"]=="area"
+                else "Load-constrained mode: area calculated to cover full load demand")
     story.append(Paragraph(
-        f"Mounting: {mounting_choice}   |   "
-        f"Module: {module_choice}   |   GCR: {r['gcr']}   |   "
-        f"Setback: {setback_pct}%", S_note))
+        f"Mode: {mode_txt}   |   "
+        f"Mounting: {mounting_choice}   |   Module: {module_choice}   |   "
+        f"GCR: {r['gcr']}   |   Setback: {setback_pct}%   |   "
+        f"Load coverage: {r['load_covered_pct']}%", S_note))
 
     # Space constraint summary if applicable
     if avail_m2 and avail_m2 > 0 and not r["area_ok"] and r["max_kwp_area"]:
@@ -1438,10 +1497,13 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
 
     # Area breakdown detail
     with st.expander("📐 Area breakdown detail"):
+        mode_label = "🔒 Area-constrained mode — system sized to fit available space" if r["area_mode"]=="area" else "📏 Load-constrained mode — area calculated for full load coverage"
+        st.caption(mode_label)
         ad1,ad2 = st.columns(2)
         ad1.markdown(f"""
 | Component | Value |
 |---|---|
+| Mode | {"Area → System" if r["area_mode"]=="area" else "Load → Area"} |
 | Panels | {fmt(r['num_pan'])} × {MODULE_SPECS[module_choice]['wp']} Wp |
 | Panel area each | {round(MODULE_SPECS[module_choice]['wp']/1000/MODULE_SPECS[module_choice]['eff'],2)} m² |
 | Total panel area | **{fmt(r['panel_m2'],1)} m²** |
@@ -1451,11 +1513,12 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
         ad2.markdown(f"""
 | Component | Value |
 |---|---|
+| Available / required area | **{fmt(avail_m2_g,0) if avail_m2_g else fmt(r["site_m2"],0)} m²** |
 | Land buffer factor | {MOUNTING_TYPES[mounting_choice]['land_buffer']}× |
 | Setback / unusable | {setback_pct}% |
 | Total site area | **{fmt(r['site_m2'],0)} m²** |
 | In hectares | **{fmt(r['site_ha'],3)} ha** |
-| Array m²/kWp | {fmt(r['arr_m2_kwp'],1)} m²/kWp |
+| Load coverage | **{r["load_covered_pct"]}%** |
 | Site m²/kWp | **{fmt(r['site_m2_kwp'],1)} m²/kWp** |
         """)
 
