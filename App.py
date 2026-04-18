@@ -164,15 +164,37 @@ tilt_angle    = c2.number_input("Fixed tilt (°)", min_value=0, max_value=45, va
 soiling_loss  = c3.slider("Soiling loss (%)", 1.0, 15.0, 4.0, 0.5)
 ground_albedo = c4.slider("Ground albedo (%)", 5, 40, 20)
 
-st.markdown('<p class="sh">Step 4 — Site area</p>', unsafe_allow_html=True)
-c1,c2,c3 = st.columns(3)
-available_area = c1.number_input("Available area (m²) — leave 0 if unknown",
-    min_value=0.0, value=0.0, format="%.0f",
-    help="If you enter an area, the app checks if it fits the system. Leave 0 to just calculate required area.")
-setback_pct    = c2.slider("Setback / unusable area (%)", 0, 40, 15,
-    help="Roads, fencing, inverter pads, fire clearances — typically 10–20%.")
-azimuth        = c3.selectbox("Panel orientation",
+st.markdown('<p class="sh">Step 4 — Site area & space constraint</p>', unsafe_allow_html=True)
+
+c1, c2 = st.columns(2)
+space_type = c1.radio("Space type",
+    ["Roof area (rooftop solar)", "Land plot (ground mount)", "No constraint — calculate required area"],
+    horizontal=True,
+    help="Choose what limits your available space.")
+azimuth = c2.selectbox("Panel orientation",
     ["South (optimal)","South-East","South-West","East-West (split)"])
+
+# Show area input only when a constraint is selected
+available_area = 0.0
+setback_pct    = 15
+if space_type != "No constraint — calculate required area":
+    area_label = "Roof area available (m²)" if "Roof" in space_type else "Land plot area (m²)"
+    c1, c2, c3 = st.columns(3)
+    available_area = c1.number_input(area_label, min_value=0.0, value=0.0, format="%.0f",
+        help="The app will calculate max system capacity and load coverage based on this constraint.")
+    setback_pct = c2.slider("Setback / unusable (%)", 0, 40,
+        10 if "Roof" in space_type else 15,
+        help="Roof: parapets, HVAC, fire breaks typically 10–15%. Ground: roads, fencing, equipment 15–20%.")
+    if available_area > 0:
+        c3.markdown(f"""
+<div style="background:#f0faf4;border:1px solid #9FE1CB;border-radius:8px;padding:.7rem .9rem;margin-top:1.5rem">
+<p style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:#0F6E56;font-weight:600;margin-bottom:.3rem">Space constraint active</p>
+<p style="font-size:.85rem;color:#0F6E56;font-weight:600;margin:0">{int(available_area):,} m² {("roof" if "Roof" in space_type else "plot")} entered</p>
+<p style="font-size:.75rem;color:#555;margin:0">Max capacity &amp; coverage % will be shown in results</p>
+</div>
+""", unsafe_allow_html=True)
+else:
+    setback_pct = 15
 
 st.markdown('<p class="sh">Step 5 — Financial parameters</p>', unsafe_allow_html=True)
 ptype_cfg  = PROJECT_TYPES[project_label]
@@ -612,6 +634,86 @@ def calc_monthly(climate, act_kwp, pr, degr_pct):
     return rows
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLIANCE DATABASE — watts, daily hours by context
+# Source: UAE DEWA energy guidelines, IEC typical values
+# ─────────────────────────────────────────────────────────────────────────────
+APPLIANCES = {
+    "Home": [
+        {"name": "Split AC (1.5 ton)",       "watts": 1500, "hours": 8,  "icon": "❄️"},
+        {"name": "Split AC (2.5 ton)",        "watts": 2500, "hours": 8,  "icon": "❄️"},
+        {"name": "Refrigerator",              "watts": 150,  "hours": 24, "icon": "🧊"},
+        {"name": "Washing machine",           "watts": 500,  "hours": 1,  "icon": "🫧"},
+        {"name": "Clothes dryer",             "watts": 3000, "hours": 1,  "icon": "💨"},
+        {"name": "Dishwasher",                "watts": 1200, "hours": 1,  "icon": "🍽️"},
+        {"name": "Electric oven",             "watts": 2000, "hours": 1,  "icon": "🍳"},
+        {"name": "Microwave",                 "watts": 1000, "hours": 0.5,"icon": "📡"},
+        {"name": "Water heater (electric)",   "watts": 3000, "hours": 2,  "icon": "🚿"},
+        {"name": "LED TV (55 inch)",             "watts": 80,   "hours": 5,  "icon": "📺"},
+        {"name": "LED lighting (whole home)", "watts": 200,  "hours": 6,  "icon": "💡"},
+        {"name": "Laptop / computer",         "watts": 100,  "hours": 8,  "icon": "💻"},
+        {"name": "Pool pump",                 "watts": 750,  "hours": 6,  "icon": "🏊"},
+        {"name": "Electric vehicle charger",  "watts": 7000, "hours": 4,  "icon": "🚗"},
+        {"name": "Water pump (villa)",        "watts": 500,  "hours": 3,  "icon": "💧"},
+    ],
+    "Office": [
+        {"name": "Central HVAC (per 100m²)",  "watts": 3500, "hours": 10, "icon": "❄️"},
+        {"name": "Desktop computer + monitor","watts": 200,  "hours": 9,  "icon": "🖥️"},
+        {"name": "Laptop",                    "watts": 65,   "hours": 9,  "icon": "💻"},
+        {"name": "LED office lighting (100m²)","watts": 400, "hours": 10, "icon": "💡"},
+        {"name": "Printer (laser, A4)",       "watts": 400,  "hours": 2,  "icon": "🖨️"},
+        {"name": "Server rack (2U)",          "watts": 500,  "hours": 24, "icon": "🗄️"},
+        {"name": "Elevator (8-person)",       "watts": 5500, "hours": 4,  "icon": "🛗"},
+        {"name": "Projector / display",       "watts": 350,  "hours": 4,  "icon": "📽️"},
+        {"name": "Coffee machine",            "watts": 1200, "hours": 2,  "icon": "☕"},
+        {"name": "Water cooler / dispenser",  "watts": 100,  "hours": 24, "icon": "💧"},
+        {"name": "CCTV system (8 cameras)",   "watts": 80,   "hours": 24, "icon": "📷"},
+        {"name": "Access control / alarms",   "watts": 50,   "hours": 24, "icon": "🔒"},
+        {"name": "Refrigerator (office)",     "watts": 150,  "hours": 24, "icon": "🧊"},
+        {"name": "EV charging station (22kW)","watts": 22000,"hours": 4,  "icon": "🔌"},
+        {"name": "UPS system (10 kVA)",       "watts": 500,  "hours": 24, "icon": "⚡"},
+    ],
+    "Industrial": [
+        {"name": "Air compressor (10 HP)",    "watts": 7500, "hours": 8,  "icon": "🔧"},
+        {"name": "Air compressor (50 HP)",    "watts": 37000,"hours": 8,  "icon": "🔧"},
+        {"name": "Centrifugal pump (7.5 kW)", "watts": 7500, "hours": 16, "icon": "💧"},
+        {"name": "Conveyor motor (5 kW)",     "watts": 5000, "hours": 10, "icon": "⚙️"},
+        {"name": "CNC machine",               "watts": 10000,"hours": 8,  "icon": "🏭"},
+        {"name": "Welding machine",           "watts": 8000, "hours": 6,  "icon": "🔥"},
+        {"name": "Industrial chiller (20 ton)","watts":25000,"hours": 12, "icon": "❄️"},
+        {"name": "Warehouse lighting (1000m²)","watts":2000, "hours": 12, "icon": "💡"},
+        {"name": "Forklift charger",          "watts": 3000, "hours": 8,  "icon": "🚜"},
+        {"name": "Dust extraction system",    "watts": 4000, "hours": 8,  "icon": "💨"},
+        {"name": "Water treatment pump",      "watts": 5500, "hours": 20, "icon": "💧"},
+        {"name": "Industrial oven (electric)","watts":15000, "hours": 6,  "icon": "🔥"},
+        {"name": "Injection moulding machine","watts":20000, "hours": 8,  "icon": "🏭"},
+        {"name": "Office / welfare block AC", "watts": 5000, "hours": 10, "icon": "❄️"},
+        {"name": "Security / CCTV / access",  "watts": 500,  "hours": 24, "icon": "📷"},
+    ],
+}
+
+def calc_appliance_runs(daily_gen_kwh, context):
+    """
+    Given daily generation in kWh and a context (Home/Office/Industrial),
+    calculate how many of each appliance can run per day.
+    Returns list of dicts sorted by daily consumption desc.
+    """
+    appliances = APPLIANCES.get(context, [])
+    results = []
+    for a in appliances:
+        daily_kwh_each = a["watts"] * a["hours"] / 1000
+        qty = int(daily_gen_kwh // daily_kwh_each) if daily_kwh_each > 0 else 0
+        results.append({
+            "icon":      a["icon"],
+            "name":      a["name"],
+            "watts":     a["watts"],
+            "hours":     a["hours"],
+            "daily_kwh": round(daily_kwh_each, 2),
+            "qty":       qty,
+        })
+    return sorted(results, key=lambda x: x["daily_kwh"], reverse=True)
+
+
 def safe_pdf_text(text):
     """
     Make text safe for ReportLab PDF rendering.
@@ -887,6 +989,40 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         f"Mounting: {mounting_choice}   |   "
         f"Module: {module_choice}   |   GCR: {r['gcr']}   |   "
         f"Setback: {setback_pct}%", S_note))
+
+    # Space constraint summary if applicable
+    if avail_m2 and avail_m2 > 0 and not r["area_ok"] and r["max_kwp_area"]:
+        max_kw   = r["max_kwp_area"]
+        max_gen  = max_kw * r["spec_yld"] / 1000
+        coverage = min(100.0, max_gen * 1000 / r["ann_dem"] * 100) if r["ann_dem"] > 0 else 0
+        story.append(Spacer(1, 6))
+        sc_data = [
+            ["SPACE CONSTRAINT ANALYSIS", "", "", ""],
+            ["Maximum capacity in available space", f"{fmt(max_kw,0)} kWp",
+             "Annual generation (space-limited)", f"{fmt(max_gen,1)} MWh/yr"],
+            ["Load coverage achievable", f"{round(coverage,1)}%",
+             "Uncovered load", f"{round(100-coverage,1)}%"],
+        ]
+        sc_tbl = Table(sc_data, colWidths=[W*0.35, W*0.15, W*0.35, W*0.15])
+        sc_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0), AMBER),
+            ("TEXTCOLOR",     (0,0),(-1,0), WHITE),
+            ("FONTNAME",      (0,0),(-1,0), BOLD_FONT),
+            ("FONTSIZE",      (0,0),(-1,0), 8.5),
+            ("SPAN",          (0,0),(-1,0)),
+            ("ALIGN",         (0,0),(-1,0), "CENTER"),
+            ("FONTNAME",      (0,1),(-1,-1), BODY_FONT),
+            ("FONTSIZE",      (0,1),(-1,-1), 8.5),
+            ("FONTNAME",      (1,1),(1,-1),  BOLD_FONT),
+            ("FONTNAME",      (3,1),(3,-1),  BOLD_FONT),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
+            ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+            ("TOPPADDING",    (0,0),(-1,-1), 4),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 4),
+            ("LEFTPADDING",   (0,0),(-1,-1), 6),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 6),
+        ]))
+        story.append(sc_tbl)
     story.append(Spacer(1, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1338,6 +1474,39 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
     df_full  = pd.concat([df, df_total], ignore_index=True)
     st.dataframe(df_full, use_container_width=True, hide_index=True)
     st.caption(f"Monthly averages from NASA POWER 22-year climatology · Annual total generation: {round(annual_gen_check,1)} MWh/yr · System: {fmt(r['act_kwp'],1)} kWp at PR {r['pr']}%")
+
+    # ── What can you run daily ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("⚡ What can you run daily on this system?")
+    st.markdown("Based on your **average daily generation** — select your project context to see what the system can power:")
+
+    daily_gen_avg = r["ann_gen"] / 365 / 1000   # kWh/day average
+
+    wc1, wc2 = st.columns([1, 3])
+    with wc1:
+        context = st.radio("Context", ["Home", "Office", "Industrial"],
+            help="Home = villa/residential. Office = commercial building. Industrial = factory/warehouse.")
+        st.metric("Avg daily generation", f"{round(daily_gen_avg,1)} kWh/day")
+        st.metric("Peak day (May avg)",
+            f"{round(max(calc_monthly(climate, r['act_kwp'], r['pr'], r['degr']), key=lambda x: x['gen_mwh'])['gen_mwh']*1000/31,1)} kWh/day")
+        st.metric("Lowest day (Dec avg)",
+            f"{round(min(calc_monthly(climate, r['act_kwp'], r['pr'], r['degr']), key=lambda x: x['gen_mwh'])['gen_mwh']*1000/31,1)} kWh/day")
+
+    with wc2:
+        app_results = calc_appliance_runs(daily_gen_avg, context)
+        import pandas as pd
+        df_app = pd.DataFrame([{
+            "Appliance":            f"{a['icon']} {a['name']}",
+            "Power (W)":            f"{a['watts']:,}",
+            "Daily use (hrs)":      a["hours"],
+            "Energy / day (kWh)":   a["daily_kwh"],
+            "Units the system runs": a["qty"] if a["qty"] > 0 else "< 1",
+        } for a in app_results])
+        st.dataframe(df_app, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Based on {round(daily_gen_avg,1)} kWh/day average generation from {fmt(r['act_kwp'],1)} kWp system. "
+            f"'Units the system runs' = how many of each appliance can operate simultaneously at listed daily hours. "
+            f"Actual usage depends on operating schedule and coincidence factor.")
 
     # ── Technical ─────────────────────────────────────────────────────────────
     st.divider()
