@@ -1480,17 +1480,22 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
     st.subheader("⚡ What can you run daily on this system?")
     st.markdown("Based on your **average daily generation** — select your project context to see what the system can power:")
 
-    daily_gen_avg = r["ann_gen"] / 365 / 1000   # kWh/day average
+    daily_gen_avg = r["ann_gen"] / 365   # kWh/day — ann_gen is in kWh
+
+    # Pre-calculate monthly rows once for efficiency
+    _monthly_rows = calc_monthly(climate, r['act_kwp'], r['pr'], r['degr'])
+    _peak_row  = max(_monthly_rows, key=lambda x: x['gen_mwh'])
+    _low_row   = min(_monthly_rows, key=lambda x: x['gen_mwh'])
+    peak_day_kwh = _peak_row['gen_mwh'] * 1000 / _peak_row['days']   # MWh/month → kWh/day
+    low_day_kwh  = _low_row['gen_mwh']  * 1000 / _low_row['days']
 
     wc1, wc2 = st.columns([1, 3])
     with wc1:
         context = st.radio("Context", ["Home", "Office", "Industrial"],
             help="Home = villa/residential. Office = commercial building. Industrial = factory/warehouse.")
         st.metric("Avg daily generation", f"{round(daily_gen_avg,1)} kWh/day")
-        st.metric("Peak day (May avg)",
-            f"{round(max(calc_monthly(climate, r['act_kwp'], r['pr'], r['degr']), key=lambda x: x['gen_mwh'])['gen_mwh']*1000/31,1)} kWh/day")
-        st.metric("Lowest day (Dec avg)",
-            f"{round(min(calc_monthly(climate, r['act_kwp'], r['pr'], r['degr']), key=lambda x: x['gen_mwh'])['gen_mwh']*1000/31,1)} kWh/day")
+        st.metric(f"Peak day ({_peak_row['month']} avg)",  f"{round(peak_day_kwh,1)} kWh/day")
+        st.metric(f"Lowest day ({_low_row['month']} avg)", f"{round(low_day_kwh,1)} kWh/day")
 
     with wc2:
         app_results = calc_appliance_runs(daily_gen_avg, context)
