@@ -512,10 +512,19 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     arr_m2_kwp  = array_m2 / act_kwp if act_kwp > 0 else 0
 
     # Generation
-    ann_solar = act_kwp*psh*365*pr
-    pvgis_used=False
-    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
-        ann_solar=pvgis_data["yield_kwh_yr"]; pvgis_used=True
+    # NASA-based yield (always calculated — used as fallback and in area mode)
+    ann_solar_nasa = act_kwp * psh * 365 * pr
+
+    # PVGIS yield: ONLY use in load-constrained mode because PVGIS was fetched
+    # with the load-based kwp_est BEFORE calculate() ran. In area mode the
+    # act_kwp is different (smaller), making the PVGIS value incorrect.
+    pvgis_used = False
+    if area_mode == "load" and pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        # PVGIS returns total yield for the system; use directly
+        ann_solar  = pvgis_data["yield_kwh_yr"]
+        pvgis_used = True
+    else:
+        ann_solar  = ann_solar_nasa
     wind_cf=0; ann_wind=0
     if wind_kw>0:
         # Rayleigh distribution wind CF — IEC power curve approximation
@@ -539,7 +548,13 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     ann_gen  = ann_solar+ann_wind
     spec_yld = ann_solar/act_kwp if act_kwp>0 else 0
     cap_f    = ann_gen/((act_kwp+wind_kw)*8760)*100 if (act_kwp+wind_kw)>0 else 0
-    self_s   = min(100.0, ann_gen/ann_dem*100) if ann_dem>0 else 100.0
+    # Self-sufficiency:
+    # - Load mode: how much of annual demand the system covers (can exceed 100% with oversizing)
+    # - Area mode: use load_covered_pct (derived from actual kwp vs required kwp)
+    if area_mode == "area":
+        self_s = load_covered_pct   # already capped at 100
+    else:
+        self_s = min(100.0, ann_gen/ann_dem*100) if ann_dem>0 else 100.0
 
     # BESS
     def_bh = ptype_cfg["bess_h"]
@@ -1291,7 +1306,13 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # PV module table
     panel_tech = module_choice.split(" (")[0]
     tracker_note = mounting_choice.split("—")[0].strip()
-    pvgis_src = f"PVGIS JRC: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr" if pvgis_data and pvgis_data.get("yield_kwh_yr") else "NASA POWER model"
+    if r["area_mode"] == "area":
+        pvgis_src = ("NASA POWER model (area-constrained: PVGIS not applied — "
+                     "would require re-fetch with actual system size)")
+    elif pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        pvgis_src = f"PVGIS JRC: {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr"
+    else:
+        pvgis_src = "NASA POWER model"
     story.append(kv_tbl("PV MODULE &amp; SOLAR SYSTEM", [
         ("Module technology",        panel_tech),
         ("Module wattage",           f"{MODULE_SPECS[module_choice]['wp']} Wp"),
@@ -1708,22 +1729,16 @@ if go:
             st.error(f"NASA POWER error: {climate['error']}"); st.stop()
         st.write(f"✅ GHI {climate.get('ghi_daily','—')} kWh/m²/day · Wind {climate.get('ws50','—')} m/s · Temp {climate.get('temp','—')}°C · Kt {climate.get('clearness','—')}")
 
-        st.write("🌍 PVGIS cross-check (EU JRC)...")
         connected_kw = to_kw(connected_power, power_unit)
         ptype_cfg_v  = PROJECT_TYPES[project_label]
-        psh_v        = climate.get("psh",5.5)
-        kwp_est      = (connected_kw*ptype_cfg_v["op_h"]/(psh_v*0.78)*oversizing) if psh_v>0 else connected_kw*2
-        pvgis_data   = fetch_pvgis(lat,lon,tilt_angle,az_deg(azimuth),round(kwp_est,1))
-        if pvgis_data and pvgis_data.get("yield_kwh_yr"):
-            st.write(f"✅ PVGIS yield {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr · losses {pvgis_data.get('loss_pct','—')}%")
-        else:
-            st.write("ℹ️ PVGIS not available — using NASA model"); pvgis_data=None
+        psh_v        = climate.get("psh", 5.5)
+        tariff_aed   = custom_tariff / 100
 
+        # ── Step A: Run calculations first (needed to get actual act_kwp) ──
         st.write("⚙️ Engineering calculations...")
-        tariff_aed = custom_tariff/100
-        result=calculate(
+        result = calculate(
             connected_kw=connected_kw, ptype_cfg=ptype_cfg_v,
-            climate=climate, pvgis_data=pvgis_data,
+            climate=climate, pvgis_data=None,   # no PVGIS yet — fetch after sizing
             module_choice=module_choice, mounting_choice=mounting_choice,
             inverter_choice=inverter_choice, grid_type=grid_type,
             oversizing=oversizing, tilt=tilt_angle, az_label=azimuth,
@@ -1736,9 +1751,39 @@ if go:
             net_metering=net_metering, avail_m2=available_area,
             setback_pct=setback_pct, lat=lat, lon=lon,
         )
+        act_kwp_final = result["act_kwp"]   # correct kWp for this project
+
+        # ── Step B: Fetch PVGIS with the CORRECT system size ───────────────
+        st.write("🌍 PVGIS cross-check (EU JRC) — using actual system size...")
+        pvgis_data = fetch_pvgis(lat, lon, tilt_angle, az_deg(azimuth), round(act_kwp_final, 1))
+        if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+            st.write(f"✅ PVGIS yield {fmt(pvgis_data['yield_kwh_yr'],0)} kWh/yr · losses {pvgis_data.get('loss_pct','—')}% · system {act_kwp_final} kWp")
+        else:
+            st.write("ℹ️ PVGIS not available — using NASA model")
+            pvgis_data = None
+
+        # ── Step C: Re-run calculations with PVGIS if available ────────────
+        if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+            st.write("🔄 Updating generation with PVGIS verified yield...")
+            result = calculate(
+                connected_kw=connected_kw, ptype_cfg=ptype_cfg_v,
+                climate=climate, pvgis_data=pvgis_data,
+                module_choice=module_choice, mounting_choice=mounting_choice,
+                inverter_choice=inverter_choice, grid_type=grid_type,
+                oversizing=oversizing, tilt=tilt_angle, az_label=azimuth,
+                soiling_pct=soiling_loss, albedo_pct=ground_albedo,
+                tariff_aed=tariff_aed, wacc=wacc, life=lifetime,
+                degr=degradation, opex_pct=opex_pct, debt_ratio=debt_ratio,
+                debt_rate=debt_rate, bess_override=bess_override,
+                bess_chem=bess_chem, bess_h_custom=bess_h_custom,
+                include_wind=include_wind, carbon_price_aed=carbon_price,
+                net_metering=net_metering, avail_m2=available_area,
+                setback_pct=setback_pct, lat=lat, lon=lon,
+            )
+
         num_pan_global = result["num_pan"]
-        st.write("✅ Done")
-        status.update(label="Report ready ✅",state="complete",expanded=False)
+        st.write("✅ Complete")
+        status.update(label="Report ready ✅", state="complete", expanded=False)
 
     # Climate bar
     st.divider()
