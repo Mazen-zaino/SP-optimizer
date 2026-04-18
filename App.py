@@ -468,7 +468,7 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     area_ok = True; max_kwp_area = None
     if avail_m2 and avail_m2>0:
         usable_avail = avail_m2*(1-setback_pct/100)/mnt["land_buffer"]
-        max_kwp_area = usable_avail*gcr*mod["eff"]*1000
+        max_kwp_area = usable_avail*gcr*mod["eff"]   # kWp = m² × gcr × efficiency (kWp/m²)
         if max_kwp_area < act_kwp*0.95: area_ok=False
 
     # Generation
@@ -478,8 +478,24 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         ann_solar=pvgis_data["yield_kwh_yr"]; pvgis_used=True
     wind_cf=0; ann_wind=0
     if wind_kw>0:
-        wind_cf = min(0.42,max(0.12,(ws50/13)**3*0.42))
-        ann_wind = wind_kw*wind_cf*8760
+        # Rayleigh distribution wind CF — IEC power curve approximation
+        # Extrapolate NASA 50m wind to 100m hub height (wind shear α=0.14)
+        v_hub = ws50 * (100/50)**0.14
+        vc, vr, vo = 3.5, 12.0, 25.0   # cut-in, rated, cut-out (m/s)
+        c_ray = v_hub / 0.8862          # Rayleigh scale param (=vm/Γ(1.5))
+        # Time fraction above rated (= full power)
+        import math as _m
+        p_full = _m.exp(-(vr/c_ray)**2) - _m.exp(-(vo/c_ray)**2)
+        # Integrate partial power region (cut-in to rated) numerically
+        n_seg, p_partial = 12, 0.0
+        dv = (vr - vc) / n_seg
+        for _i in range(n_seg):
+            vi = vc + (_i + 0.5)*dv
+            f_vi = 2*vi/c_ray**2 * _m.exp(-(vi/c_ray)**2)  # Rayleigh pdf
+            p_frac = (vi**3 - vc**3)/(vr**3 - vc**3)       # cubic power curve
+            p_partial += p_frac * f_vi * dv
+        wind_cf = round(min(0.50, max(0.05, p_partial + p_full)), 3)
+        ann_wind = wind_kw * wind_cf * 8760
     ann_gen  = ann_solar+ann_wind
     spec_yld = ann_solar/act_kwp if act_kwp>0 else 0
     cap_f    = ann_gen/((act_kwp+wind_kw)*8760)*100 if (act_kwp+wind_kw)>0 else 0
@@ -508,7 +524,9 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     cap_con = (cap_mod+cap_inv+cap_mnt+cap_bos+cap_epc)*0.05
     cap_wnd = wind_kw*1000*4.0*AED_PER_USD
     total_cap= cap_mod+cap_inv+cap_mnt+cap_bos+cap_epc+cap_con+cap_wnd+bess_cap_aed
-    cap_wp   = total_cap/(act_kwp*1000) if act_kwp>0 else 0
+    cap_wp      = total_cap/(act_kwp*1000) if act_kwp>0 else 0
+    total_kw    = act_kwp + wind_kw   # combined solar + wind capacity
+    cap_kw_tot  = total_cap/total_kw if total_kw>0 else 0   # AED per kW total
     def pct(x): return round(x/total_cap*100,1) if total_cap>0 else 0
     cb={"Modules":pct(cap_mod),"Inverters":pct(cap_inv),"Mounting &amp; civil":pct(cap_mnt),
         "BOS &amp; electrical":pct(cap_bos),"EPC / design":pct(cap_epc),
@@ -564,7 +582,7 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         bess_kwh=round(bess_kwh,1),bess_kw=round(bess_kw,1),
         bess_h=round(bess_kwh/bess_kw,1) if bess_kw>0 else 0,
         bess_cap_aed=round(bess_cap_aed,0),
-        total_cap=round(total_cap,0),cap_wp=round(cap_wp,2),
+        total_cap=round(total_cap,0),cap_wp=round(cap_wp,2),cap_kw_tot=round(cap_kw_tot,0),
         ann_opex=round(ann_opex,0),lcoe=round(lcoe,1),
         tariff_aed=tariff_aed,y1rev=round(y1rev,0),
         y1net=round(cfs[1],0),npv=round(npv_v,0),
@@ -577,7 +595,7 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         co2_yr=round(co2_yr,1),co2_lf=round(co2_lf,0),
         co2_rev=round(co2_rev,0),hh=hh,
         t_kw=t_kw,n_t=n_t,h_hub=h_hub,r_dt=r_dt,
-        wind_cf=round(wind_cf*100,1),
+        wind_cf=round(wind_cf*100,1),ann_wind_mwh=round(ann_wind/1000,1),
         degr=degr,net_metering=net_metering,
     )
 
@@ -1036,7 +1054,9 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         ["Renewable capacity",  f"{fmt(r['act_kwp'],1)} kWp",        "Self-sufficiency",   f"{r['self_s']}%"],
         ["Annual generation",   f"{fmt(r['ann_gen_mwh'],1)} MWh/yr", "Capacity factor",    f"{r['cap_f']}%"],
         ["Specific yield",      f"{fmt(r['spec_yld'],0)} kWh/kWp/yr","Performance ratio",  f"{r['pr']}%"],
-        ["Total CAPEX",         aed_s(r['total_cap']),                "CAPEX per Wp",       f"AED {r['cap_wp']:.2f}"],
+        ["Total CAPEX",         aed_s(r['total_cap']),
+         "CAPEX per kW (total)" if r['wind_kw']>0 else "CAPEX per Wp",
+         f"AED {fmt(r['cap_kw_tot'],0)}/kW" if r['wind_kw']>0 else f"AED {r['cap_wp']:.2f}/Wp"],
         ["LCOE",                f"AED {r['lcoe']:.0f}/MWh",          "Tariff (avoided)",   f"{int(r['tariff_aed']*100)} fils/kWh"],
         ["Simple payback",      f"{r['payback']} years",             "Project IRR",        f"{r['irr']}%" if r['irr'] else "—"],
         [f"NPV ({r['life']} yr)", aed_s(r['npv']),                   "Equity IRR",         f"{r['eq_irr']}%" if r['eq_irr'] else "—"],
@@ -1189,14 +1209,14 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     mo_tbl.setStyle(mo_style)
     story.append(mo_tbl)
     story.append(Spacer(1, 4))
+    _peak_m = max(monthly_rows_pdf, key=lambda x: x['gen_mwh'])
+    _low_m  = min(monthly_rows_pdf, key=lambda x: x['gen_mwh'])
+    wind_note_pdf = (f"   |   Wind contribution: +{fmt(r['ann_wind_mwh'],1)} MWh/yr (annual total incl. wind: "
+                     f"{round(annual_total_mwh + r['ann_wind_mwh'],1)} MWh/yr)") if r['wind_kw']>0 else ""
     story.append(Paragraph(
-        f"Peak generation month: "
-        f"{max(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['month']} "
-        f"({max(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['gen_mwh']:.1f} MWh)   |   "
-        f"Lowest generation month: "
-        f"{min(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['month']} "
-        f"({min(monthly_rows_pdf, key=lambda x: x['gen_mwh'])['gen_mwh']:.1f} MWh)   |   "
-        f"Annual total: {round(annual_total_mwh,1)} MWh/yr",
+        f"Peak solar month: {_peak_m['month']} ({_peak_m['gen_mwh']:.1f} MWh)   |   "
+        f"Lowest solar month: {_low_m['month']} ({_low_m['gen_mwh']:.1f} MWh)   |   "
+        f"Solar annual total: {round(annual_total_mwh,1)} MWh/yr{wind_note_pdf}",
         S_note))
     story.append(Spacer(1, 12))
 
@@ -1253,7 +1273,27 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
             ("BESS CAPEX",         aed_s(r['bess_cap_aed'])),
         ]
     story.append(kv_tbl("INVERTER, GRID &amp; BESS", inv_rows_data, c55, c45))
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 6))
+
+    # Wind turbine specs (hybrid only)
+    if r['wind_kw'] > 0:
+        iec_class = "IEC Class I" if r['h_hub'] >= 100 else "IEC Class II"
+        turbine_spacing_m = r['r_dt'] * 5 if r['r_dt'] > 0 else 0
+        wind_rows_data = [
+            ("Wind capacity",            f"{fmt(r['wind_kw'],1)} kW total"),
+            ("Turbine rated power",       f"{fmt(r['t_kw'])} kW each"),
+            ("Number of turbines",        fmt(r['n_t'])),
+            ("IEC wind class",            iec_class),
+            ("Hub height",               f"{r['h_hub']} m"),
+            ("Rotor diameter",            f"{r['r_dt']} m"),
+            ("Minimum turbine spacing",   f"{turbine_spacing_m} m (5x rotor dia.)"),
+            ("Capacity factor (modelled)",f"{r['wind_cf']}%"),
+            ("Annual wind generation",    f"{fmt(r['ann_wind_mwh'],1)} MWh/yr"),
+        ]
+        story.append(kv_tbl("WIND TURBINE SPECIFICATIONS", wind_rows_data, c55, c45))
+        story.append(Spacer(1, 6))
+
+    story.append(Spacer(1, 6))
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 5: FINANCIAL ANALYSIS
@@ -1264,7 +1304,8 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     # CAPEX breakdown
     capex_rows = [
         ("Total CAPEX",          aed_s(r['total_cap'])),
-        ("CAPEX per Wp",         f"AED {r['cap_wp']:.2f}/Wp"),
+        ("CAPEX per kW (total system)" if r['wind_kw']>0 else "CAPEX per Wp",
+         f"AED {fmt(r['cap_kw_tot'],0)}/kW (solar+wind)" if r['wind_kw']>0 else f"AED {r['cap_wp']:.2f}/Wp"),
     ] + [(f"  {k}", f"{v}%") for k, v in r['cb'].items() if v > 0] + [
         ("Equity required",      aed_s(r['eq_aed'])),
         ("Project debt",         aed_s(r['dbt_aed'])),
@@ -1316,7 +1357,10 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
 
     risk_data = [
         ["Risk",                                            "Mitigation"],
-        ["Soiling & dust (UAE desert environment)",         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating"],
+        # Soiling risk description adapts to humidity/climate
+        ["Soiling & dust" + (" — arid/desert" if climate.get("humidity",50)<55 else " — coastal/tropical"),
+         "Bi-weekly dry cleaning or robotic auto-cleaning; anti-soiling glass coating" if climate.get("humidity",50)<55
+         else "Monthly cleaning sufficient; anti-reflective coating recommended for high-humidity/coastal sites"],
         [f"High cell temperature ({r['cell_temp']}C avg operating)", "Specify TOPCon/HJT modules with temp. coeff. below -0.30%/C"],
         ["Grid curtailment by DEWA/SEWA",                  "Include active power control in inverter spec; evaluate BESS for peak shifting"],
         ["Tariff / regulatory change",                     "Lock in net metering agreement or long-term PPA before financial close"],
@@ -1473,7 +1517,12 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
     df_total = pd.DataFrame([totals])
     df_full  = pd.concat([df, df_total], ignore_index=True)
     st.dataframe(df_full, use_container_width=True, hide_index=True)
-    st.caption(f"Monthly averages from NASA POWER 22-year climatology · Annual total generation: {round(annual_gen_check,1)} MWh/yr · System: {fmt(r['act_kwp'],1)} kWp at PR {r['pr']}%")
+    wind_monthly_note = ""
+    if r['wind_kw'] > 0:
+        wind_monthly_note = (f" + {fmt(r['ann_wind_mwh'],1)} MWh/yr wind (distributed evenly, "
+                             f"not shown per month). Total system: {round(annual_gen_check + r['ann_wind_mwh'],1)} MWh/yr.")
+    st.caption(f"Monthly averages from NASA POWER 22-year climatology · Solar generation: {round(annual_gen_check,1)} MWh/yr · "
+               f"System: {fmt(r['act_kwp'],1)} kWp at PR {r['pr']}%{wind_monthly_note}")
 
     # ── What can you run daily ────────────────────────────────────────────────
     st.divider()
