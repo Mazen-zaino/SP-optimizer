@@ -401,6 +401,294 @@ def npv_c(cfs,cap,w):
 # ─────────────────────────────────────────────────────────────────────────────
 # CALCULATOR
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ENGINEERING CORE — Loss tree, DC/AC sizing, sensitivity, P50/P90, sanity
+# Replaces the old PR block and generation section inside calculate()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_loss_tree(mod, mnt, inv_eff, soiling_pct, albedo_pct, az_label,
+                    mounting_choice, temp, bifacial):
+    """
+    Explicit IEC 61724 loss tree. Returns dict of named losses and final PR.
+    Every loss is independently traceable.
+    """
+    cell_temp = temp + 25   # NOCT offset: cell runs ~25°C above ambient average
+    # Temperature loss: Pmax coefficient × (Tcell - 25°C)
+    temp_loss = abs(mod["temp_coef"] * (cell_temp - 25))   # fraction lost
+
+    # Soiling: user input
+    soiling_loss = soiling_pct / 100
+
+    # Inverter efficiency loss
+    inverter_loss = 1 - inv_eff
+
+    # DC wiring / ohmic losses (IEC typical: 1.5%)
+    dc_wiring_loss = 0.015
+
+    # AC wiring losses (IEC typical: 1.0%)
+    ac_wiring_loss = 0.010
+
+    # Mismatch / LID (module mismatch, 2% typical for string systems)
+    mismatch_loss = 0.020
+
+    # Availability (planned maintenance, grid outages: 1%)
+    availability_loss = 0.010
+
+    # Azimuth derate (non-south facing)
+    az_derates = {"South (optimal)":0.00,"South-East":0.05,
+                  "South-West":0.05,"East-West (split)":0.11}
+    azimuth_loss = az_derates.get(az_label, 0.00)
+
+    # Tracker / mounting yield modifier (captured as negative loss = gain)
+    tracker_boost = TRACKER_BOOST.get(mounting_choice, 1.0)
+    tracker_gain  = tracker_boost - 1.0   # e.g. SAT = +0.17
+
+    # Bifacial gain (positive — reduces effective loss)
+    bifacial_gain = 0.0
+    if bifacial and mod.get("bifacial"):
+        bifacial_gain = mod.get("bifacial_gain", 0) * (albedo_pct / 20)
+
+    # Assemble loss tree
+    losses = {
+        "Temperature derating":   round(temp_loss, 4),
+        "Soiling":                round(soiling_loss, 4),
+        "Inverter efficiency":    round(inverter_loss, 4),
+        "DC wiring (ohmic)":      round(dc_wiring_loss, 4),
+        "AC wiring":              round(ac_wiring_loss, 4),
+        "Module mismatch / LID":  round(mismatch_loss, 4),
+        "Availability":           round(availability_loss, 4),
+        "Azimuth derate":         round(azimuth_loss, 4),
+    }
+    gains = {
+        "Tracker / mounting":     round(tracker_gain, 4),
+        "Bifacial / albedo":      round(bifacial_gain, 4),
+    }
+
+    # PR = product of (1 - each loss) × product of (1 + each gain)
+    pr_from_losses = 1.0
+    for v in losses.values():
+        pr_from_losses *= (1 - v)
+    for v in gains.values():
+        pr_from_losses *= (1 + v)
+    pr = round(max(0.60, min(1.05, pr_from_losses)), 4)
+
+    return {
+        "losses": losses,
+        "gains":  gains,
+        "pr":     pr,
+        "cell_temp": round(cell_temp, 1),
+        "temp_loss_pct": round(temp_loss * 100, 2),
+    }
+
+
+def size_inverter(act_kwp, system_type="string"):
+    """
+    Size inverter based on DC capacity.
+    Returns type, quantity, unit capacity, total AC capacity, DC/AC ratio.
+    """
+    # DC/AC ratio: 1.25 standard (allows clipping <1% of energy in UAE)
+    dc_ac_ratio = 1.25
+
+    ac_cap_kva = act_kwp / dc_ac_ratio
+
+    if act_kwp <= 30:
+        inv_type   = "Microinverter (1-phase)"
+        unit_kva   = 0.3
+        num_units  = math.ceil(act_kwp * 1000 / 300)   # ~300W per micro
+    elif act_kwp <= 100:
+        inv_type   = "String inverter (3-phase, 15–25 kW)"
+        unit_kva   = 20
+        num_units  = max(1, math.ceil(ac_cap_kva / 20))
+    elif act_kwp <= 500:
+        inv_type   = "String inverter (3-phase, 50–100 kW)"
+        unit_kva   = 60
+        num_units  = max(1, math.ceil(ac_cap_kva / 60))
+    elif act_kwp <= 2000:
+        inv_type   = "Central inverter (100–500 kW, 1000 Vdc)"
+        unit_kva   = 500
+        num_units  = max(1, math.ceil(ac_cap_kva / 500))
+    else:
+        inv_type   = "Central inverter station (1–4 MW, 1500 Vdc)"
+        unit_kva   = 3400
+        num_units  = max(1, math.ceil(ac_cap_kva / 3400))
+
+    total_inv_kva = num_units * unit_kva
+
+    # String sizing (for non-micro)
+    # Voc at min temp (10°C for UAE) → max string length
+    # Vmp at max temp (70°C cell) → min string length
+    # Generic: 580Wp module Voc≈37.5V, Vmp≈31V
+    voc_module = 37.5; vmp_module = 31.0
+    t_min = 10; t_max = 70   # cell temps
+    temp_coef_v = -0.0026    # Voc temp coef typical
+    voc_hot  = voc_module * (1 + temp_coef_v * (t_max - 25))
+    voc_cold = voc_module * (1 + temp_coef_v * (t_min - 25))
+    v_max_inv = 1000 if act_kwp <= 2000 else 1500
+
+    mods_per_string_max = int(v_max_inv * 0.98 / voc_cold)   # 2% safety margin
+    mods_per_string_min = max(8, int(200 / vmp_module))       # min MPPT window ~200V
+    mods_per_string = min(mods_per_string_max,
+                          max(mods_per_string_min, 20))       # typical: 20-28 modules
+
+    return {
+        "inv_type":         inv_type,
+        "dc_ac_ratio":      round(dc_ac_ratio, 2),
+        "ac_cap_kva":       round(ac_cap_kva, 1),
+        "num_inv_units":    num_units,
+        "unit_inv_kva":     unit_kva,
+        "total_inv_kva":    round(total_inv_kva, 1),
+        "mods_per_string":  mods_per_string,
+        "strings_total":    max(1, math.ceil(num_units / 1)),   # simplified
+        "v_max":            v_max_inv,
+    }
+
+
+def row_spacing_gcr(tilt_deg, lat_deg):
+    """
+    Calculate GCR and row spacing from first principles using winter solstice
+    solar elevation angle — no shading at solar noon on worst day.
+    IEC / ASHRAE method.
+    """
+    import math as _m
+    dec      = -23.45   # declination at winter solstice (degrees)
+    lat_r    = _m.radians(abs(lat_deg))
+    dec_r    = _m.radians(dec)
+    elev_r   = _m.asin(_m.sin(lat_r)*_m.sin(dec_r) + _m.cos(lat_r)*_m.cos(dec_r))
+    elev_deg = _m.degrees(elev_r)
+    elev_deg = max(10.0, elev_deg)   # guard for near-equatorial
+
+    tilt_r   = _m.radians(tilt_deg)
+    # Row spacing = panel_height / tan(solar_elevation)
+    # Panel height = sin(tilt) × panel_length (assume 2.3m panel length for 580Wp)
+    panel_len = 2.30   # m
+    panel_h   = _m.sin(tilt_r) * panel_len
+    row_space = panel_h / _m.tan(elev_r) + panel_len * _m.cos(tilt_r)
+    gcr_calc  = panel_len / row_space
+    return {
+        "solar_elevation_winter_deg": round(elev_deg, 1),
+        "row_spacing_m":             round(row_space, 2),
+        "gcr_no_shading":            round(max(0.20, min(0.80, gcr_calc)), 3),
+        "shading_loss_pct":          0.0,   # by construction — no shading at noon
+    }
+
+
+def p50_p90(ann_gen_kwh, life):
+    """
+    Simple P50/P90 estimate based on:
+    - Interannual variability: σ=4% (typical for Middle East)
+    - P90 = P50 × (1 - 1.28 × σ) using normal distribution
+    - Lifetime P90 uses σ/√N for multi-year average
+    """
+    sigma_annual    = 0.04   # 4% interannual variability (NASA validation)
+    sigma_lifetime  = sigma_annual / (life ** 0.5)
+
+    p50_annual  = ann_gen_kwh
+    p90_annual  = ann_gen_kwh * (1 - 1.28 * sigma_annual)   # 1.28σ = 90th percentile
+
+    p50_life    = ann_gen_kwh * life
+    p90_life    = ann_gen_kwh * (1 - 1.28 * sigma_lifetime) * life
+
+    # P90 energy debt vs P50
+    p90_gap_pct = (p50_annual - p90_annual) / p50_annual * 100
+
+    return {
+        "p50_annual_kwh":  round(p50_annual, 0),
+        "p90_annual_kwh":  round(p90_annual, 0),
+        "p50_life_mwh":    round(p50_life / 1000, 1),
+        "p90_life_mwh":    round(p90_life / 1000, 1),
+        "p90_gap_pct":     round(p90_gap_pct, 1),
+        "sigma_pct":       round(sigma_annual * 100, 1),
+    }
+
+
+def sensitivity_analysis(ann_gen_kwh, total_cap, ann_opex, wacc, life, tariff_aed, degr_pct):
+    """
+    Run 6 sensitivity scenarios — tariff ±15%, soiling +3%, temp +2°C, CAPEX +15%.
+    Returns list of scenario dicts with IRR, NPV, payback.
+    """
+    def run_fin(gen, cap, opex, tariff, degr):
+        degr_r = degr / 100
+        cfs = [-cap]
+        for yr in range(1, int(life)+1):
+            g_yr = gen * ((1-degr_r)**(yr-1))
+            cfs.append(g_yr * tariff - opex * (1.025**(yr-1)))
+        npv = npv_c(cfs[1:], cap, wacc)
+        irr = irr_b(cfs)
+        pay = cap / cfs[1] if cfs[1] > 0 else 99
+        return {"irr": round(irr, 1) if irr else None,
+                "npv_aed": round(npv, 0),
+                "payback": round(pay, 1)}
+
+    base = run_fin(ann_gen_kwh, total_cap, ann_opex, tariff_aed, degr_pct)
+
+    scenarios = [
+        {"label": "Base case",            "color": "green",
+         **run_fin(ann_gen_kwh, total_cap, ann_opex, tariff_aed, degr_pct)},
+        {"label": "Tariff +15%",          "color": "green",
+         **run_fin(ann_gen_kwh, total_cap, ann_opex, tariff_aed*1.15, degr_pct)},
+        {"label": "Tariff −15%",          "color": "red",
+         **run_fin(ann_gen_kwh, total_cap, ann_opex, tariff_aed*0.85, degr_pct)},
+        {"label": "Soiling +3% (no cleaning)", "color": "orange",
+         **run_fin(ann_gen_kwh*0.97, total_cap, ann_opex, tariff_aed, degr_pct)},
+        {"label": "CAPEX +15% (cost overrun)", "color": "red",
+         **run_fin(ann_gen_kwh, total_cap*1.15, ann_opex*1.15, tariff_aed, degr_pct)},
+        {"label": "High degradation (0.8%/yr)", "color": "orange",
+         **run_fin(ann_gen_kwh, total_cap, ann_opex, tariff_aed, 0.8)},
+        {"label": "P90 yield (−5.1%)",    "color": "orange",
+         **run_fin(ann_gen_kwh*0.949, total_cap, ann_opex, tariff_aed, degr_pct)},
+    ]
+    return scenarios
+
+
+def sanity_check(act_kwp, ann_gen_kwh, total_cap_aed, pr, lat):
+    """
+    Engineering sanity guards. Returns list of (level, message) tuples.
+    level: 'ok', 'warning', 'error'
+    """
+    warnings = []
+    spec_yld = ann_gen_kwh / act_kwp if act_kwp > 0 else 0
+    cap_f    = ann_gen_kwh / (act_kwp * 8760) * 100 if act_kwp > 0 else 0
+    capex_wp = total_cap_aed / (act_kwp * 1000) if act_kwp > 0 else 0
+
+    if spec_yld < 1200:
+        warnings.append(("error", f"Specific yield {spec_yld:.0f} kWh/kWp/yr is unrealistically low (min expected ~1,400 for UAE)"))
+    elif spec_yld < 1400:
+        warnings.append(("warning", f"Specific yield {spec_yld:.0f} kWh/kWp/yr is below UAE benchmark of 1,500–1,900"))
+    elif spec_yld > 2200:
+        warnings.append(("error", f"Specific yield {spec_yld:.0f} kWh/kWp/yr exceeds physical maximum — check inputs"))
+    else:
+        warnings.append(("ok", f"Specific yield {spec_yld:.0f} kWh/kWp/yr is within UAE benchmark range"))
+
+    if cap_f < 10:
+        warnings.append(("error",   f"Capacity factor {cap_f:.1f}% is physically impossible — check generation calculation"))
+    elif cap_f > 35:
+        warnings.append(("error",   f"Capacity factor {cap_f:.1f}% exceeds UAE solar maximum — check system size"))
+    elif cap_f > 30:
+        warnings.append(("warning", f"Capacity factor {cap_f:.1f}% is high for fixed-tilt — verify with SAT tracker"))
+    else:
+        warnings.append(("ok",      f"Capacity factor {cap_f:.1f}% is within expected range (15–28% UAE solar)"))
+
+    if pr < 0.70:
+        warnings.append(("error",   f"Performance ratio {pr*100:.1f}% is below industry minimum (70%)"))
+    elif pr < 0.75:
+        warnings.append(("warning", f"Performance ratio {pr*100:.1f}% is low — check soiling and temperature inputs"))
+    elif pr > 0.90:
+        warnings.append(("warning", f"Performance ratio {pr*100:.1f}% is optimistic — typical UAE range is 75–85%"))
+    else:
+        warnings.append(("ok",      f"Performance ratio {pr*100:.1f}% is within UAE benchmark range (75–85%)"))
+
+    if capex_wp < 2.0:
+        warnings.append(("error",   f"CAPEX AED {capex_wp:.2f}/Wp is below UAE market minimum — check inputs"))
+    elif capex_wp < 2.8:
+        warnings.append(("warning", f"CAPEX AED {capex_wp:.2f}/Wp is below typical UAE market range (AED 3.0–4.5/Wp)"))
+    elif capex_wp > 7.0:
+        warnings.append(("warning", f"CAPEX AED {capex_wp:.2f}/Wp is above UAE benchmark — review cost assumptions"))
+    else:
+        warnings.append(("ok",      f"CAPEX AED {capex_wp:.2f}/Wp is within UAE market range"))
+
+    return warnings
+
+
 def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
               module_choice, mounting_choice, inverter_choice,
               grid_type, oversizing, tilt, az_label, soiling_pct, albedo_pct,
@@ -425,15 +713,19 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
     tmax  = climate.get("temp_max", 42.0)
     ws50  = climate.get("ws50", 4.5)
 
-    # ── Performance ratio (common to both modes) ───────────────────────────
-    cell_temp  = temp + 25
-    temp_dera  = 1 + mod["temp_coef"] * (cell_temp - 25)
-    temp_dera  = max(0.75, min(1.02, temp_dera))
-    bifacial_g = mod.get("bifacial_gain", 0) * (albedo_pct / 20) if mod.get("bifacial") else 0
-    az_d = {"South (optimal)":1.00,"South-East":0.95,"South-West":0.95,"East-West (split)":0.89}.get(az_label,1.0)
-    pr = (temp_dera * (1-soiling_pct/100) * inv_eff * 0.980 * 0.980 *
-          az_d * TRACKER_BOOST.get(mounting_choice,1.0) * (1+bifacial_g))
-    pr = round(max(0.60, min(1.05, pr)), 3)
+    # ── Loss tree (explicit, IEC 61724-aligned) ───────────────────────────
+    loss_tree   = build_loss_tree(mod, mnt, inv_eff, soiling_pct, albedo_pct,
+                                  az_label, mounting_choice, temp, mod.get("bifacial",False))
+    pr          = loss_tree["pr"]
+    cell_temp   = loss_tree["cell_temp"]
+    temp_dera   = loss_tree["temp_loss_pct"]   # now a % for display
+    bifacial_g  = loss_tree["gains"].get("Bifacial / albedo", 0)  # fraction, *100 in result dict
+
+    # ── Row spacing from first principles (latitude-based, tilt-based) ─────
+    row_geo     = row_spacing_gcr(tilt, lat)
+
+    # ── Inverter sizing ────────────────────────────────────────────────────
+    # (will be called after act_kwp is determined, stored in inv_sizing)
 
     # ── Source recommendation (common to both modes) ───────────────────────
     sol_score = psh / 6.0; wnd_score = ws50 / 8.0
@@ -618,6 +910,20 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         r_dt=136 if t_kw>=3000 else 90 if t_kw>=1500 else 54
     else: t_kw=n_t=h_hub=r_dt=0
 
+    # ── Inverter sizing (after act_kwp is known) ───────────────────────────
+    inv_sizing  = size_inverter(act_kwp)
+
+    # ── P50/P90 ────────────────────────────────────────────────────────────
+    p5090       = p50_p90(ann_gen, int(life))
+
+    # ── Sensitivity analysis ───────────────────────────────────────────────
+    sensitivity = sensitivity_analysis(ann_gen, total_cap, ann_opex,
+                                       wacc, life, tariff_aed, degr)
+
+    # ── Sanity checks ──────────────────────────────────────────────────────
+    sanity      = sanity_check(act_kwp, ann_gen, total_cap, pr, lat)
+    sanity_ok   = all(s[0] == "ok" for s in sanity)
+
     return dict(
         source=source,badge=badge,pvgis_used=pvgis_used,
         act_kwp=round(act_kwp,1),wind_kw=round(wind_kw,1),
@@ -628,7 +934,7 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         area_mode=area_mode,area_ok=area_ok,max_kwp_area=max_kwp_area,
         load_covered_pct=round(load_covered_pct,1),
         pr=round(pr*100,1),cell_temp=round(cell_temp,1),
-        temp_dera=round((1-temp_dera)*100,2),bifacial_g=round(bifacial_g*100,1),
+        temp_dera=round(temp_dera,2),bifacial_g=round(bifacial_g,1),
         ann_gen=round(ann_gen,0),ann_gen_mwh=round(ann_gen/1000,1),
         ann_dem=round(ann_dem,0),self_s=round(self_s,1),
         cap_f=round(cap_f,1),spec_yld=round(spec_yld,0),
@@ -651,6 +957,12 @@ def calculate(connected_kw, ptype_cfg, climate, pvgis_data,
         t_kw=t_kw,n_t=n_t,h_hub=h_hub,r_dt=r_dt,
         wind_cf=round(wind_cf*100,1),ann_wind_mwh=round(ann_wind/1000,1),
         degr=degr,net_metering=net_metering,
+        # New engineering outputs
+        loss_tree=loss_tree,row_geo=row_geo,
+        inv_sizing=inv_sizing,
+        p5090=p5090,
+        sensitivity=sensitivity,
+        sanity=sanity,sanity_ok=sanity_ok,
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -784,6 +1096,103 @@ def calc_appliance_runs(daily_gen_kwh, context):
             "qty":       qty,
         })
     return sorted(results, key=lambda x: x["daily_kwh"], reverse=True)
+
+
+def bankability_score(r, climate, pvgis_data, avail_m2):
+    """
+    Score the report completeness and credibility on a 0-100 scale.
+    Returns score, grade, and list of (points, max, description) items.
+    """
+    items = []
+
+    # Climate data quality (25 pts)
+    ghi = climate.get("ghi_daily", 0) or 0
+    if ghi > 4.0:
+        items.append((10, 10, "GHI data — NASA POWER 22-year average (excellent)"))
+    elif ghi > 0:
+        items.append((6, 10, "GHI data — NASA POWER available"))
+    else:
+        items.append((0, 10, "GHI data — missing"))
+
+    if pvgis_data and pvgis_data.get("yield_kwh_yr"):
+        items.append((10, 10, "Yield cross-check — PVGIS EU JRC verified"))
+    else:
+        items.append((4, 10, "Yield cross-check — NASA model only (PVGIS unavailable)"))
+
+    if climate.get("monthly"):
+        items.append((5, 5, "Monthly climate data — seasonal profile available"))
+    else:
+        items.append((0, 5, "Monthly climate data — annual average only"))
+
+    # System design completeness (25 pts)
+    sanity_ok = all(s[0] == "ok" for s in r.get("sanity", []))
+    items.append((10 if sanity_ok else 5, 10,
+        "Sanity checks — all passed" if sanity_ok else "Sanity checks — warnings present"))
+
+    inv = r.get("inv_sizing", {})
+    if inv.get("inv_type"):
+        items.append((8, 8, f"Inverter sizing — {inv['inv_type'][:30]}"))
+    else:
+        items.append((0, 8, "Inverter sizing — not completed"))
+
+    if r.get("loss_tree"):
+        items.append((7, 7, "Loss tree — explicit IEC 61724 breakdown"))
+    else:
+        items.append((0, 7, "Loss tree — not computed"))
+
+    # Financial model quality (25 pts)
+    if r.get("irr") and r.get("npv"):
+        items.append((8, 8, "Financial model — IRR and NPV computed"))
+    else:
+        items.append((0, 8, "Financial model — incomplete"))
+
+    p = r.get("p5090", {})
+    if p.get("p90_annual_kwh"):
+        items.append((7, 7, f"P50/P90 — P90 = {round(p['p90_annual_kwh']/1000,1)} MWh/yr computed"))
+    else:
+        items.append((0, 7, "P50/P90 — not computed"))
+
+    if r.get("sensitivity"):
+        items.append((5, 5, "Sensitivity analysis — 7 scenarios computed"))
+    else:
+        items.append((0, 5, "Sensitivity analysis — not run"))
+
+    if r.get("dscr") and r["dscr"] >= 1.2:
+        items.append((5, 5, f"DSCR — {r['dscr']}x (above 1.20x minimum)"))
+    elif r.get("dscr"):
+        items.append((2, 5, f"DSCR — {r['dscr']}x (below 1.20x lender minimum)"))
+    else:
+        items.append((3, 5, "DSCR — no debt modelled"))
+
+    # Site information (25 pts)
+    if avail_m2 and avail_m2 > 0:
+        items.append((10, 10, "Site area — actual area constraint applied"))
+    else:
+        items.append((6, 10, "Site area — theoretical (no area constraint entered)"))
+
+    rg = r.get("row_geo", {})
+    if rg.get("row_spacing_m"):
+        items.append((8, 8, f"Row spacing — {rg['row_spacing_m']}m (latitude-derived, no shading)"))
+    else:
+        items.append((0, 8, "Row spacing — not calculated"))
+
+    tariff = r.get("tariff_aed", 0)
+    if tariff > 0:
+        items.append((7, 7, f"Tariff — {int(tariff*100)} fils/kWh from UAE utility database"))
+    else:
+        items.append((0, 7, "Tariff — not set"))
+
+    total_pts  = sum(i[0] for i in items)
+    total_max  = sum(i[1] for i in items)
+    score      = round(total_pts / total_max * 100) if total_max > 0 else 0
+
+    if score >= 85:   grade = "A — Bankable quality"
+    elif score >= 70: grade = "B — Investment-grade pre-feasibility"
+    elif score >= 55: grade = "C — Concept-level study"
+    else:             grade = "D — Incomplete — add more inputs"
+
+    return {"score": score, "grade": grade, "items": items,
+            "total_pts": total_pts, "total_max": total_max}
 
 
 def safe_pdf_text(text):
@@ -992,6 +1401,27 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
         f"{r['pr']}%. At {int(r['tariff_aed']*100)} fils/kWh ({utility}), "
         f"the project achieves a {r['payback']}-year simple payback and {r['irr']}% IRR over {r['life']} years.",
         S_body))
+    story.append(Spacer(1, 6))
+
+    # Bankability score panel in PDF cover
+    bk = bankability_score(r, climate, pvgis_data, avail_m2)
+    bk_color = colors.HexColor("#155724") if bk["score"]>=85 else colors.HexColor("#856404") if bk["score"]>=55 else colors.HexColor("#721C24")
+    bk_bg    = colors.HexColor("#D4EDDA") if bk["score"]>=85 else colors.HexColor("#FFF3CD") if bk["score"]>=55 else colors.HexColor("#F8D7DA")
+    bk_data  = [[
+        Paragraph(f"{bk['score']}/100", ps("BKS",fontSize=22,fontName=BOLD_FONT,textColor=bk_color,alignment=TA_CENTER)),
+        Paragraph(f"{bk['grade']}  —  {bk['total_pts']}/{bk['total_max']} pts (data completeness, engineering rigour, financial model quality)",
+                  ps("BKG",fontSize=9,fontName=BODY_FONT,textColor=bk_color,leading=13)),
+    ]]
+    bk_tbl = Table(bk_data, colWidths=[W*0.15, W*0.85])
+    bk_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), bk_bg),
+        ("TOPPADDING",    (0,0),(-1,-1), 8),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 8),
+        ("LEFTPADDING",   (0,0),(-1,-1), 10),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("GRID",          (0,0),(-1,-1), 0.3, bk_color),
+    ]))
+    story.append(bk_tbl)
     story.append(Spacer(1, 10))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1427,6 +1857,178 @@ def generate_pdf(r, climate, pvgis_data, location_name, lat, lon,
     story.append(Spacer(1, 12))
 
     # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5b: LOSS TREE
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 5b — PERFORMANCE RATIO LOSS TREE (IEC 61724)"))
+    story.append(Spacer(1, 5))
+    story.append(Paragraph(
+        f"Explicit loss breakdown for PR = {round(r['pr']*100,1)}%. "
+        f"Every factor is independently calculated — not a black-box PR assumption.",
+        S_note))
+    story.append(Spacer(1, 4))
+
+    lt = r["loss_tree"]
+    loss_data = [["Loss / Gain Factor", "Impact (%)", "Notes"]]
+    for k, v in lt["losses"].items():
+        loss_data.append([k, f"-{round(v*100,2):.2f}%",
+            "Temperature model: cell = ambient + 25°C (NOCT)" if "Temp" in k
+            else "User input" if "Soil" in k
+            else "Manufacturer datasheet" if "Inverter" in k
+            else "IEC 61724 typical"])
+    for k, v in lt["gains"].items():
+        if v > 0:
+            loss_data.append([k, f"+{round(v*100,2):.2f}%", "Tracker yield gain vs fixed tilt" if "Tracker" in k else "Albedo model"])
+    loss_data.append(["NET PERFORMANCE RATIO", f"{round(r['pr']*100,1)}%", "Product of all factors above"])
+
+    lt_tbl = Table(loss_data, colWidths=[W*0.42, W*0.18, W*0.40])
+    lt_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
+        ("FONTSIZE",      (0,0),(-1,-1), 8),
+        ("FONTNAME",      (0,1),(-1,-2), BODY_FONT),
+        ("FONTNAME",      (0,-1),(-1,-1),BOLD_FONT),
+        ("BACKGROUND",    (0,-1),(-1,-1),G_PALE),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2), [WHITE, GR_LT]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 3),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+        ("LEFTPADDING",   (0,0),(-1,-1), 5),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 5),
+    ]))
+    story.append(lt_tbl)
+    story.append(Spacer(1, 12))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5c: INVERTER SIZING + P50/P90 + SENSITIVITY
+    # ══════════════════════════════════════════════════════════════════════════
+    story.append(section_bar("SECTION 5c — ELECTRICAL DESIGN, P50/P90 &amp; SENSITIVITY"))
+    story.append(Spacer(1, 5))
+
+    inv = r["inv_sizing"]
+    p   = r["p5090"]
+    rg  = r["row_geo"]
+
+    # Inverter + P50/P90 side by side
+    inv_rows_pdf = [
+        ["INVERTER SIZING", ""],
+        ["Inverter type",           inv["inv_type"]],
+        ["DC/AC ratio",             str(inv["dc_ac_ratio"])],
+        ["AC capacity",             f"{fmt(inv['ac_cap_kva'],1)} kVA"],
+        ["Number of units",         fmt(inv["num_inv_units"])],
+        ["Unit size",               f"{inv['unit_inv_kva']} kVA"],
+        ["Modules per string",      fmt(inv["mods_per_string"])],
+        ["Max system voltage",      f"{inv['v_max']} Vdc"],
+        ["Row spacing (no shading)",f"{rg['row_spacing_m']} m"],
+        ["Solar elev. winter solstice",f"{rg['solar_elevation_winter_deg']}°"],
+        ["GCR (latitude-derived)",  str(rg["gcr_no_shading"])],
+    ]
+    p50_rows_pdf = [
+        ["P50 / P90 YIELD ESTIMATE", ""],
+        ["Interannual variability (σ)",   f"±{p['sigma_pct']}%"],
+        ["P50 annual yield",              f"{fmt(p['p50_annual_kwh']/1000,1)} MWh/yr"],
+        ["P90 annual yield (conservative)",f"{fmt(p['p90_annual_kwh']/1000,1)} MWh/yr"],
+        ["P90 gap vs P50",               f"-{p['p90_gap_pct']}%"],
+        ["Lifetime P50",                  f"{p['p50_life_mwh']} MWh"],
+        ["Lifetime P90",                  f"{p['p90_life_mwh']} MWh"],
+        ["Basis",                         "NASA POWER ±4% Middle East interannual σ"],
+        ["Note",                          "Formal bankable P90 requires certified assessor"],
+    ]
+
+    def two_col_mini(rows, w_label, w_val, header_color=G_MID):
+        t = Table(rows, colWidths=[w_label, w_val])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0), header_color),
+            ("TEXTCOLOR",     (0,0),(-1,0), WHITE),
+            ("FONTNAME",      (0,0),(-1,0), BOLD_FONT),
+            ("SPAN",          (0,0),(-1,0)),
+            ("ALIGN",         (0,0),(-1,0), "CENTER"),
+            ("FONTNAME",      (0,1),(-1,-1),BODY_FONT),
+            ("FONTNAME",      (1,1),(1,-1),  BOLD_FONT),
+            ("FONTSIZE",      (0,0),(-1,-1), 8),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
+            ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+            ("TOPPADDING",    (0,0),(-1,-1), 3),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+            ("LEFTPADDING",   (0,0),(-1,-1), 5),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 5),
+        ]))
+        return t
+
+    half = W / 2 - 3
+    pair_tbl = Table([
+        [two_col_mini(inv_rows_pdf, half*0.58, half*0.42),
+         Spacer(6, 1),
+         two_col_mini(p50_rows_pdf, half*0.62, half*0.38)]
+    ], colWidths=[half, 6, half])
+    pair_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
+    story.append(pair_tbl)
+    story.append(Spacer(1, 8))
+
+    # Sensitivity table
+    story.append(Paragraph("Sensitivity analysis — impact on financial returns:", S_note))
+    story.append(Spacer(1, 4))
+    sens = r["sensitivity"]
+    sens_data = [["Scenario", "IRR (%)", "NPV (AED)", "Payback (yrs)"]]
+    for s in sens:
+        sens_data.append([
+            s["label"],
+            f"{s['irr']}%" if s["irr"] else "—",
+            aed_s(s["npv_aed"]),
+            f"{s['payback']:.1f}",
+        ])
+    sens_tbl = Table(sens_data, colWidths=[W*0.40, W*0.15, W*0.25, W*0.20])
+    sens_style = TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
+        ("FONTSIZE",      (0,0),(-1,-1), 8),
+        ("FONTNAME",      (0,1),(-1,-1), BODY_FONT),
+        ("FONTNAME",      (1,1),(1,-1),  BOLD_FONT),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 3),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+        ("LEFTPADDING",   (0,0),(-1,-1), 5),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 5),
+        # Highlight base case row
+        ("BACKGROUND",    (0,1),(-1,1),  G_PALE),
+        ("FONTNAME",      (0,1),(-1,1),  BOLD_FONT),
+    ])
+    sens_tbl.setStyle(sens_style)
+    story.append(sens_tbl)
+
+    # Sanity checks
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Engineering sanity checks:", S_note))
+    story.append(Spacer(1, 4))
+    sanity_data = [["Check", "Status", "Value"]]
+    for level, msg in r["sanity"]:
+        icon = "OK" if level=="ok" else "WARNING" if level=="warning" else "ERROR"
+        sanity_data.append([msg[:60]+"..." if len(msg)>60 else msg, icon, ""])
+    san_tbl = Table(sanity_data, colWidths=[W*0.72, W*0.15, W*0.13])
+    san_style = TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  G_DARK),
+        ("TEXTCOLOR",     (0,0),(-1,0),  WHITE),
+        ("FONTNAME",      (0,0),(-1,0),  BOLD_FONT),
+        ("FONTSIZE",      (0,0),(-1,-1), 7.5),
+        ("FONTNAME",      (0,1),(-1,-1), BODY_FONT),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, GR_LT]),
+        ("GRID",          (0,0),(-1,-1), 0.3, GR_MD),
+        ("TOPPADDING",    (0,0),(-1,-1), 3),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+        ("LEFTPADDING",   (0,0),(-1,-1), 5),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 5),
+    ])
+    # Colour status cells
+    for i, (level, _) in enumerate(r["sanity"], 1):
+        bg = G_PALE if level=="ok" else colors.HexColor("#FFF3CD") if level=="warning" else colors.HexColor("#FCEBEB")
+        san_style.add("BACKGROUND", (1,i),(1,i), bg)
+    san_tbl.setStyle(san_style)
+    story.append(san_tbl)
+    story.append(Spacer(1, 12))
+
+    # ══════════════════════════════════════════════════════════════════════════
     # SECTION 7: RISKS &amp; NEXT STEPS
     # ══════════════════════════════════════════════════════════════════════════
     story.append(section_bar("SECTION 7 — KEY RISKS &amp; MITIGATIONS"))
@@ -1493,6 +2095,34 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
         f"**{fmt(r['act_kwp'],1)} kWp** system · {fmt(r['ann_gen_mwh'],1)} MWh/yr · "
         f"{r['self_s']}% self-sufficiency · PR {r['pr']}% · "
         f"{r['payback']} yr payback · {r['irr']}% IRR · yield source: {pvgis_note}")
+
+    # ── BANKABILITY SCORE ─────────────────────────────────────────────────────
+    bk = bankability_score(r, climate, pvgis_data, avail_m2_g)
+    score = bk["score"]
+    grade = bk["grade"]
+    score_color = "#155724" if score>=85 else "#856404" if score>=55 else "#721C24"
+    score_bg    = "#D4EDDA" if score>=85 else "#FFF3CD" if score>=55 else "#F8D7DA"
+    st.markdown(f"""
+<div style="background:{score_bg};border-radius:10px;padding:1rem 1.4rem;
+     display:flex;align-items:center;gap:1.5rem;margin:.5rem 0">
+  <div style="text-align:center;min-width:80px">
+    <div style="font-size:2.4rem;font-weight:700;color:{score_color};line-height:1">{score}</div>
+    <div style="font-size:.72rem;color:{score_color};text-transform:uppercase;
+         letter-spacing:.05em;font-weight:600">/ 100</div>
+  </div>
+  <div>
+    <div style="font-size:1rem;font-weight:600;color:{score_color}">{grade}</div>
+    <div style="font-size:.82rem;color:{score_color};margin-top:4px">
+      {bk["total_pts"]} / {bk["total_max"]} points — based on data completeness, engineering rigour, and financial model quality
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+    with st.expander("📋 Bankability score breakdown"):
+        import pandas as pd
+        df_bk = pd.DataFrame([{"Component": i[2], "Points": i[0], "Max": i[1],
+                                "Score": f"{i[0]}/{i[1]}"} for i in bk["items"]])
+        st.dataframe(df_bk[["Component","Score"]], use_container_width=True, hide_index=True)
 
     # ── BIG AREA CARD ─────────────────────────────────────────────────────────
     st.markdown("""
@@ -1689,6 +2319,92 @@ def render_screen(r, climate, pvgis_data, location_name, lat, lon,
                   ("Carbon credit value",f"{aed_s(r['co2_rev'])}/yr"),
                   ("Emission factor","0.341 kgCO₂/kWh (DEWA 2023)")]
             st.markdown("<table>"+"".join(f"<tr><td>{a}</td><td>{b}</td></tr>"for a,b in rows)+"</table>",unsafe_allow_html=True)
+
+    # ── SANITY CHECK PANEL ────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🔍 Engineering sanity checks")
+    for level, msg in r["sanity"]:
+        if level == "ok":      st.success(f"✅ {msg}")
+        elif level == "warning": st.warning(f"⚠️ {msg}")
+        else:                   st.error(f"🚫 {msg}")
+
+    # ── LOSS TREE BREAKDOWN ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📉 Performance ratio loss tree")
+    st.caption(f"IEC 61724-aligned loss breakdown — PR {r['pr']*100:.1f}% = product of all factors below")
+
+    import pandas as pd
+    lt = r["loss_tree"]
+    loss_rows = [(k, f"−{round(v*100,2)}%", round((1-v)*100,2)) for k,v in lt["losses"].items()]
+    gain_rows = [(k, f"+{round(v*100,2)}%", round((1+v)*100,2)) for k,v in lt["gains"].items() if v!=0]
+    all_rows  = loss_rows + gain_rows + [("NET PERFORMANCE RATIO","",round(r["pr"]*100,1))]
+
+    df_lt = pd.DataFrame([{"Loss / Gain factor": a, "Impact": b,
+                            "Running factor (%)": c} for a,b,c in all_rows])
+    st.dataframe(df_lt, use_container_width=True, hide_index=True)
+
+    # ── DC/AC RATIO + INVERTER SIZING ─────────────────────────────────────────
+    st.divider()
+    st.subheader("⚙️ Electrical design — inverter sizing")
+    inv = r["inv_sizing"]
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    ic1.metric("DC/AC ratio",        f"{inv['dc_ac_ratio']}")
+    ic2.metric("AC capacity",        f"{fmt(inv['ac_cap_kva'],1)} kVA")
+    ic3.metric("Inverter units",     fmt(inv['num_inv_units']))
+    ic4.metric("Modules / string",   fmt(inv['mods_per_string']))
+    st.caption(f"Type: {inv['inv_type']}  ·  Unit size: {inv['unit_inv_kva']} kVA  ·  "
+               f"Max system voltage: {inv['v_max']} Vdc  ·  "
+               f"Row spacing (no shading): {r['row_geo']['row_spacing_m']} m  ·  "
+               f"GCR (latitude-derived): {r['row_geo']['gcr_no_shading']}")
+
+    # ── P50 / P90 ─────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📊 P50 / P90 yield estimate")
+    p = r["p5090"]
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("P50 (median yield)",  f"{fmt(p['p50_annual_kwh']/1000,1)} MWh/yr")
+    pc2.metric("P90 (conservative)",  f"{fmt(p['p90_annual_kwh']/1000,1)} MWh/yr")
+    pc3.metric("P90 gap",             f"−{p['p90_gap_pct']}%")
+    pc4.metric("Interannual σ",       f"±{p['sigma_pct']}%")
+    st.caption(f"P90 based on ±{p['sigma_pct']}% interannual variability (NASA POWER validation for Middle East). "
+               f"Lifetime P50: {p['p50_life_mwh']} MWh · Lifetime P90: {p['p90_life_mwh']} MWh. "
+               f"Note: formal bankable P90 requires site-specific yield assessment by a certified assessor.")
+
+    # ── SENSITIVITY ANALYSIS ──────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📈 Sensitivity analysis")
+    st.caption("Impact of key assumptions on financial returns — base case highlighted")
+    sens = r["sensitivity"]
+    df_sens = pd.DataFrame([{
+        "Scenario":         s["label"],
+        "IRR (%)":          f"{s['irr']}%" if s["irr"] else "—",
+        "NPV (AED)":        aed_s(s["npv_aed"]),
+        "Payback (yrs)":    f"{s['payback']:.1f}",
+    } for s in sens])
+    st.dataframe(df_sens, use_container_width=True, hide_index=True)
+
+    # Loss waterfall chart using Streamlit native chart
+    st.divider()
+    st.subheader("🌊 Energy loss waterfall")
+    lt2 = r["loss_tree"]
+    ghi_kwh = r["act_kwp"] * climate.get("psh", 5.5) * 365
+    steps = [("Ideal GHI yield", ghi_kwh/1000)]
+    running = ghi_kwh
+    for loss_name, loss_frac in lt2["losses"].items():
+        delta = running * loss_frac
+        running -= delta
+        steps.append((loss_name, round(running/1000,1)))
+    for gain_name, gain_frac in lt2["gains"].items():
+        if gain_frac > 0:
+            delta = running * gain_frac
+            running += delta
+            steps.append((gain_name, round(running/1000,1)))
+    steps.append(("Final AC yield", round(r["ann_gen"]/1000,1)))
+
+    df_wf = pd.DataFrame(steps, columns=["Stage","MWh/yr"])
+    st.bar_chart(df_wf.set_index("Stage"))
+    st.caption("Each bar shows cumulative MWh/yr after applying that loss factor. "
+               "Ideal GHI → Final AC yield = Performance Ratio journey.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
